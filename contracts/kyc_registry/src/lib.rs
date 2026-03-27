@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, BytesN, IntoVal};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd)]
@@ -38,7 +40,13 @@ impl KycRegistry {
     }
 
     /// Set the KYC level for a user. Admin only.
-    pub fn set_kyc_level(env: Env, user: Address, level: KycLevel, expiry: u64, provider_hash: BytesN<32>) {
+    pub fn set_kyc_level(
+        env: Env,
+        user: Address,
+        level: KycLevel,
+        expiry: u64,
+        provider_hash: BytesN<32>,
+    ) {
         Self::require_admin(&env);
 
         let record = KycRecord {
@@ -47,17 +55,21 @@ impl KycRegistry {
             kyc_provider_hash: provider_hash,
         };
 
-        env.storage().persistent().set(&DataKey::Kyc(user.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Kyc(user.clone()), &record);
 
-        env.events().publish(
-            (symbol_short!("kyc_set"), user),
-            record.level
-        );
+        env.events()
+            .publish((symbol_short!("kyc_set"), user), record.level);
     }
 
     /// Get the KYC level for a user. Returns None if expired or not found.
     pub fn get_kyc_level(env: Env, user: Address) -> KycLevel {
-        match env.storage().persistent().get::<_, KycRecord>(&DataKey::Kyc(user)) {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, KycRecord>(&DataKey::Kyc(user))
+        {
             Some(record) => {
                 if env.ledger().timestamp() > record.expiry {
                     KycLevel::None
@@ -79,17 +91,20 @@ impl KycRegistry {
     pub fn revoke_kyc(env: Env, user: Address) {
         Self::require_admin(&env);
 
-        env.storage().persistent().remove(&DataKey::Kyc(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Kyc(user.clone()));
 
-        env.events().publish(
-            (symbol_short!("kyc_rvk"), user),
-            ()
-        );
+        env.events().publish((symbol_short!("kyc_rvk"), user), ());
     }
 
     /// Internal helper to require admin authorization.
     fn require_admin(env: &Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         admin.require_auth();
     }
 }
