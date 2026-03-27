@@ -1,9 +1,7 @@
-# [workspace]
+[workspace]
 resolver = "2"
 members = [
     "escrow",
-    "multisig",
-    "stream",
     "tests",
     "contracts/allowance",
     "contracts/bridge_receiver",
