@@ -6,8 +6,11 @@
 
 import { AssetCode } from '../types/asset.types';
 import { exchangeRateService } from './exchange-rate.service';
+import { acquireDistributedLock } from './redis.service';
 
 const REFRESH_INTERVAL_MS = 60_000; // 60 seconds
+const LOCK_KEY = 'mm:exchange:refresh:lock';
+const LOCK_TTL_SECONDS = 55; // slightly less than interval to allow failover
 
 /** All asset pairs to keep warm in the cache. */
 const TRACKED_PAIRS: Array<[AssetCode, AssetCode]> = [
@@ -20,6 +23,9 @@ const TRACKED_PAIRS: Array<[AssetCode, AssetCode]> = [
 let refreshHandle: ReturnType<typeof setInterval> | null = null;
 
 async function refresh(): Promise<void> {
+  const acquired = await acquireDistributedLock(LOCK_KEY, LOCK_TTL_SECONDS);
+  if (!acquired) return; // another instance is refreshing
+
   try {
     await exchangeRateService.fetchMultipleRates(TRACKED_PAIRS);
   } catch (err) {
