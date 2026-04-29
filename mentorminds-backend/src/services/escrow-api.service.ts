@@ -42,6 +42,7 @@ export interface EscrowRepository {
 export interface SorobanEscrowService {
   createEscrow(input: {
     escrowId: string;
+    bookingId: string;
     mentorId: string;
     learnerId: string;
     amount: string;
@@ -90,6 +91,7 @@ export class EscrowApiService {
 
   async createEscrow(input: {
     id: string;
+    bookingId: string;
     mentorId: string;
     learnerId: string;
     amount: string;
@@ -117,6 +119,7 @@ export class EscrowApiService {
     try {
       const chainResult = await this.sorobanEscrowService.createEscrow({
         escrowId: created.id,
+        bookingId: input.bookingId,
         mentorId: created.mentorId,
         learnerId: created.learnerId,
         amount: created.amount,
