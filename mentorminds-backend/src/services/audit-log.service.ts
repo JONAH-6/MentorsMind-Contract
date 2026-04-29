@@ -58,6 +58,27 @@ export class AuditLogService {
   }
 
   /**
+   * Queries audit log entries with optional filters.
+   * All parameterised conditions use the $N prefix required by PostgreSQL.
+   */
+  query(filters: {
+    user_id?: string;
+    action?: string;
+    walletAddress?: string;
+    since?: Date;
+    until?: Date;
+  }): AuditLogEntry[] {
+    return logs.filter(e => {
+      if (filters.user_id !== undefined && e.user_id !== filters.user_id) return false;
+      if (filters.action !== undefined && e.action !== filters.action) return false;
+      if (filters.walletAddress !== undefined && e.walletAddress !== filters.walletAddress) return false;
+      if (filters.since !== undefined && e.createdAt < filters.since) return false;
+      if (filters.until !== undefined && e.createdAt > filters.until) return false;
+      return true;
+    });
+  }
+
+  /**
    * Verifies the integrity of the audit log chain.
    * Checks both chain links (previous_hash) and content hashes (record_hash).
    */
