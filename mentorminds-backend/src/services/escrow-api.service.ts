@@ -55,7 +55,13 @@ export interface SorobanEscrowService {
   
   resolveDispute(input: {
     escrowId: string;
+    /** Stellar public key of the admin resolving the dispute */
+    resolvedBy: string;
   }): Promise<{ txHash: string }>;
+}
+
+export interface AdminWalletRepository {
+  getStellarPublicKey(adminUserId: string): Promise<string | null>;
 }
 
 const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
@@ -63,7 +69,8 @@ const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
 export class EscrowApiService {
   constructor(
     private readonly escrowRepository: EscrowRepository,
-    private readonly sorobanEscrowService: SorobanEscrowService
+    private readonly sorobanEscrowService: SorobanEscrowService,
+    private readonly adminWalletRepository?: AdminWalletRepository
   ) {}
 
   /**
@@ -205,7 +212,13 @@ export class EscrowApiService {
     return updatedEscrow;
   }
 
-  async resolveDispute(escrowId: string): Promise<EscrowRecord> {
+  async resolveDispute(
+    escrowId: string,
+    resolution?: string,
+    notes?: string,
+    stellarTxHash?: string,
+    adminUserId?: string
+  ): Promise<EscrowRecord> {
     const escrow = await this.escrowRepository.findById(escrowId);
     if (!escrow) {
       throw new Error(`Escrow ${escrowId} not found`);
@@ -215,6 +228,21 @@ export class EscrowApiService {
         `Cannot resolve dispute for escrow in ${escrow.status} status`
       );
     }
+
+    // Fix #375: resolve the admin's Stellar public key so the on-chain audit
+    // trail records the actual admin identity rather than the hardcoded string 'admin'.
+    let resolvedBy = 'admin';
+    if (adminUserId) {
+      if (this.adminWalletRepository) {
+        const stellarKey = await this.adminWalletRepository.getStellarPublicKey(adminUserId);
+        resolvedBy = stellarKey ?? adminUserId;
+      } else {
+        resolvedBy = adminUserId;
+      }
+    }
+
+    await this.sorobanEscrowService.resolveDispute({ escrowId, resolvedBy });
+
     return this.escrowRepository.updateStatus(escrowId, "resolved");
   }
 
