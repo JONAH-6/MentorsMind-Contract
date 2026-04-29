@@ -39,6 +39,10 @@ export interface EscrowRepository {
   updateStatus(id: string, status: EscrowStatus): Promise<EscrowRecord>;
 }
 
+export interface WalletRepository {
+  findByUserId(userId: string): Promise<{ stellarPublicKey: string } | null>;
+}
+
 export interface SorobanEscrowService {
   createEscrow(input: {
     escrowId: string;
@@ -55,6 +59,8 @@ export interface SorobanEscrowService {
   
   resolveDispute(input: {
     escrowId: string;
+    /** Stellar public key of the admin resolving the dispute. */
+    resolvedBy: string;
   }): Promise<{ txHash: string }>;
 }
 
@@ -63,7 +69,8 @@ const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
 export class EscrowApiService {
   constructor(
     private readonly escrowRepository: EscrowRepository,
-    private readonly sorobanEscrowService: SorobanEscrowService
+    private readonly sorobanEscrowService: SorobanEscrowService,
+    private readonly walletRepository?: WalletRepository
   ) {}
 
   /**
@@ -205,7 +212,7 @@ export class EscrowApiService {
     return updatedEscrow;
   }
 
-  async resolveDispute(escrowId: string): Promise<EscrowRecord> {
+  async resolveDispute(escrowId: string, adminUserId: string): Promise<EscrowRecord> {
     const escrow = await this.escrowRepository.findById(escrowId);
     if (!escrow) {
       throw new Error(`Escrow ${escrowId} not found`);
@@ -215,7 +222,32 @@ export class EscrowApiService {
         `Cannot resolve dispute for escrow in ${escrow.status} status`
       );
     }
-    return this.escrowRepository.updateStatus(escrowId, "resolved");
+
+    // Look up the admin's Stellar public key — never pass a plain user ID or
+    // the string 'admin' to the contract (issue #302).
+    if (!this.walletRepository) {
+      throw new Error("walletRepository is required to resolve disputes on-chain");
+    }
+    const wallet = await this.walletRepository.findByUserId(adminUserId);
+    if (!wallet) {
+      throw new Error(`No Stellar wallet found for admin user ${adminUserId}`);
+    }
+
+    const updatedEscrow = await this.escrowRepository.updateStatus(escrowId, "resolved");
+
+    try {
+      await this.sorobanEscrowService.resolveDispute({
+        escrowId,
+        resolvedBy: wallet.stellarPublicKey,
+      });
+    } catch (error) {
+      await this.escrowRepository.updateStatus(escrowId, escrow.status);
+      throw new Error(
+        `Failed to resolve dispute on-chain for escrow ${escrowId}: ${(error as Error).message}`
+      );
+    }
+
+    return updatedEscrow;
   }
 
   async findUnreconciledEscrows(
