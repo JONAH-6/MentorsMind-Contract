@@ -6,6 +6,7 @@ export type EscrowStatus =
   | "released"
   | "disputed"
   | "refunded"
+  | "partial_refund"
   | "resolved";
 
 export interface EscrowRecord {
@@ -80,9 +81,10 @@ export class EscrowApiService {
     const validTransitions: Record<EscrowStatus, EscrowStatus[]> = {
       pending: ["funded"],
       funded: ["released", "disputed", "refunded"],
-      disputed: ["resolved"],   // refunded and released are intentionally excluded
+      disputed: ["resolved", "partial_refund"],   // partial_refund allowed from disputed
       released: [],
       refunded: [],
+      partial_refund: [],
       resolved: [],
     };
     return validTransitions[currentStatus]?.includes(newStatus) ?? false;
@@ -205,17 +207,46 @@ export class EscrowApiService {
     return updatedEscrow;
   }
 
-  async resolveDispute(escrowId: string): Promise<EscrowRecord> {
+  async resolveDispute(
+    escrowId: string,
+    options?: {
+      /** Percentage (0–100) of escrow amount paid to mentor. 0 = full refund, 100 = full release, 1–99 = partial split. */
+      splitPercentage?: number;
+    }
+  ): Promise<EscrowRecord> {
     const escrow = await this.escrowRepository.findById(escrowId);
     if (!escrow) {
       throw new Error(`Escrow ${escrowId} not found`);
     }
-    if (!EscrowApiService.validateStateTransition(escrow.status, "resolved")) {
+    if (!EscrowApiService.validateStateTransition(escrow.status, "resolved") &&
+        !EscrowApiService.validateStateTransition(escrow.status, "partial_refund")) {
       throw new Error(
         `Cannot resolve dispute for escrow in ${escrow.status} status`
       );
     }
-    return this.escrowRepository.updateStatus(escrowId, "resolved");
+
+    const splitPct = options?.splitPercentage ?? 100;
+    if (!Number.isInteger(splitPct) || splitPct < 0 || splitPct > 100) {
+      throw new Error('splitPercentage must be an integer between 0 and 100');
+    }
+
+    if (splitPct >= 1 && splitPct <= 99) {
+      // Partial split: record both payout amounts and set status to partial_refund
+      const total = parseFloat(escrow.amount);
+      const mentorAmount = ((total * splitPct) / 100).toFixed(7);
+      const learnerAmount = ((total * (100 - splitPct)) / 100).toFixed(7);
+
+      console.info(
+        `[EscrowApiService] Partial resolution for ${escrowId}: ` +
+        `mentor ${mentorAmount} (${splitPct}%), learner ${learnerAmount} (${100 - splitPct}%)`
+      );
+
+      return this.escrowRepository.updateStatus(escrowId, "partial_refund");
+    }
+
+    // 0% to mentor = full refund to learner; 100% = full release to mentor
+    const finalStatus: EscrowStatus = splitPct === 0 ? "refunded" : "resolved";
+    return this.escrowRepository.updateStatus(escrowId, finalStatus);
   }
 
   async findUnreconciledEscrows(
