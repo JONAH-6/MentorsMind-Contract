@@ -49,6 +49,10 @@ export interface EscrowRepository {
   createTransaction(record: TransactionRecord): Promise<void>;
 }
 
+export interface WalletRepository {
+  findByUserId(userId: string): Promise<{ stellarPublicKey: string } | null>;
+}
+
 export interface SorobanEscrowService {
     createEscrow(input: {
         escrowId: string;
