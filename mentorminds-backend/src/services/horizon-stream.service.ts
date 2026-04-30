@@ -1,10 +1,20 @@
 import { eventIndexerService } from "./event-indexer.service";
 import { ParsedEvent, ContractEvent } from "../types/event-indexer.types";
 import { paymentTrackerService } from "./payment-tracker.service";
+import { getRedisClient } from "./redis.service";
+
+const CURSOR_KEY_PREFIX = 'mm:horizon:cursor';
 
 const LARGE_PAYMENT_THRESHOLD = parseFloat(
-  process.env.LARGE_PAYMENT_THRESHOLD_XLM ?? "10000"
+  process.env.LARGE_TX_ALERT_THRESHOLD_XLM ??
+  process.env.LARGE_PAYMENT_THRESHOLD_XLM ?? // legacy fallback
+  "1000"
 );
+
+// Rate-limit large-payment alerts: track the last alert time per sender address.
+// Only one alert per unique `from` address per hour to prevent alert storms.
+const ALERT_RATE_LIMIT_MS = 60 * 60 * 1000; // 1 hour
+const lastAlertTimestampByAddress = new Map<string, number>();
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
@@ -138,14 +148,17 @@ export class HorizonStreamService {
     this.retryCount = 0;
     this.abortController = new AbortController();
 
-    const cursorState = eventIndexerService.getCursorState();
-    const cursor = cursorState.lastCursor || cursorState.lastLedger.toString();
+    const streamAccount = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+    const redisKey = `${CURSOR_KEY_PREFIX}:${streamAccount || 'global'}`;
+    const persistedCursor = await getRedisClient().get(redisKey).catch(() => null);
 
-    console.log(`[HorizonStream] Starting stream from cursor: ${cursor}`);
+    const cursorState = eventIndexerService.getCursorState();
+    const cursor = persistedCursor ?? cursorState.lastCursor ?? cursorState.lastLedger.toString() || 'now';
+
+    console.log(`[HorizonStream] Starting stream from cursor: ${cursor}${persistedCursor ? ' (from Redis)' : ''}`);
 
     try {
       const platformAccounts = this.getPlatformAccounts();
-      const streamAccount = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
 
       if (streamAccount) {
         console.log(
@@ -310,8 +323,12 @@ export class HorizonStreamService {
       // Save to database
       await eventIndexerService.saveEvent(contractEvent);
 
-      // Update cursor state
+      // Update cursor state in memory and persist to Redis
       eventIndexerService.updateCursorState(ledger, parsed.paging_token);
+      const account = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim() || 'global';
+      await getRedisClient()
+        .set(`${CURSOR_KEY_PREFIX}:${account}`, parsed.paging_token ?? ledger.toString())
+        .catch((err) => console.error('[HorizonStream] Failed to persist cursor to Redis:', err));
     } catch (error) {
       console.error("[HorizonStream] Error processing event data:", error);
     }
@@ -659,6 +676,12 @@ export class HorizonStreamService {
   /**
    * Alert admins about large incoming transactions that don't match any pending transaction.
    * This helps detect anomalies like unexpected high-value payments.
+   *
+   * Fix #377:
+   * - Only called from the unmatched-payment branch (never for matched payments).
+   * - Rate-limited to one alert per unique sender address per hour.
+   * - Threshold configurable via LARGE_TX_ALERT_THRESHOLD_XLM env var (default 1000).
+   * - Alert includes a human-readable reason field.
    */
   private async alertOnLargeIncomingTransaction(
     payment: { from: string; to: string; amount: string; asset: string; txHash?: string },
@@ -672,7 +695,18 @@ export class HorizonStreamService {
     }
 
     if (amountNum >= LARGE_PAYMENT_THRESHOLD) {
-      const reason = `Unrecognized large payment: no matching pending transaction found for sender ${payment.from}`;
+      // Rate-limit: skip if we already alerted for this sender within the last hour.
+      const now = Date.now();
+      const lastAlert = lastAlertTimestampByAddress.get(payment.from) ?? 0;
+      if (now - lastAlert < ALERT_RATE_LIMIT_MS) {
+        console.log(
+          `[HorizonStream] Rate-limiting large-payment alert for sender ${payment.from} (last alert ${Math.round((now - lastAlert) / 1000)}s ago)`
+        );
+        return;
+      }
+      lastAlertTimestampByAddress.set(payment.from, now);
+
+      const reason = `Unrecognized large payment received — no matching pending transaction found for sender ${payment.from}`;
 
       console.warn(
         `[HorizonStream] ALERT: Large unmatched payment detected`,
@@ -700,6 +734,7 @@ export class HorizonStreamService {
           account,
           txHash: payment.txHash,
           threshold: LARGE_PAYMENT_THRESHOLD,
+          reason,
         },
       });
 
@@ -710,6 +745,52 @@ export class HorizonStreamService {
       // });
     }
   }
+
+  /**
+   * Reconciliation job: cross-check unconfirmed pending transactions older
+   * than 5 minutes against Horizon's transaction history and confirm any that
+   * are found to be successful on-chain.
+   */
+  async reconcilePendingTransactions(): Promise<void> {
+    const STALE_MS = 5 * 60 * 1000;
+    const cutoff = new Date(Date.now() - STALE_MS);
+
+    const pending = await paymentTrackerService.findPending();
+    const stale = pending.filter((tx) => tx.createdAt < cutoff);
+
+    if (stale.length === 0) return;
+
+    console.log(`[HorizonStream] Reconciling ${stale.length} stale pending transaction(s)`);
+
+    for (const tx of stale) {
+      if (!tx.txHash) continue;
+      try {
+        const url = `${HORIZON_URL}/transactions/${tx.txHash}`;
+        const res = await fetch(url);
+        if (!res.ok) continue; // 404 = not yet on-chain, skip
+
+        const data = (await res.json()) as { successful: boolean; ledger: number };
+        if (data.successful) {
+          await paymentTrackerService.updateStatus(tx.id, 'confirmed', {
+            ledgerSequence: data.ledger,
+          });
+          console.log(`[HorizonStream] Reconciled tx ${tx.txHash} → confirmed (ledger ${data.ledger})`);
+        }
+      } catch (err) {
+        console.error(`[HorizonStream] Reconciliation error for tx ${tx.txHash}:`, err);
+      }
+    }
+  }
 }
 
 export const horizonStreamService = new HorizonStreamService();
+
+/** Schedule reconciliation every 5 minutes. Call once at startup. */
+export function startReconciliationJob(intervalMs = 5 * 60 * 1000): NodeJS.Timeout {
+  return setInterval(
+    () => horizonStreamService.reconcilePendingTransactions().catch((err) =>
+      console.error('[HorizonStream] Reconciliation job error:', err)
+    ),
+    intervalMs
+  );
+}

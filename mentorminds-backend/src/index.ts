@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 // Import services
 import { webSocketGateway } from "./services/websocket-gateway";
 import { horizonStreamService } from "./services/horizon-stream.service";
+import { startReconciliationJob } from "./services/horizon-stream.service";
 import { startStellarPaymentMonitoring } from "./services/stellar-stream.service";
 import { eventIndexerService } from "./services/event-indexer.service";
 import { eventIndexerRoutes } from "./routes/event-indexer.routes";
@@ -154,6 +155,7 @@ httpServer.listen(PORT, () => {
     }
 
     startStellarPaymentMonitoring();
+    startReconciliationJob();
     console.log("Starting Horizon event streaming...");
     horizonStreamService.startStreaming().catch((err) => {
       console.error("[Startup] Failed to start streaming:", err);
