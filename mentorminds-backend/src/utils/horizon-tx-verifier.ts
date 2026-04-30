@@ -29,7 +29,7 @@ export async function verifyHorizonTransaction(
 ): Promise<void> {
   const server = new Server(horizonConfig.primary);
 
-  let tx: Awaited<ReturnType<typeof server.transactions>['transaction']> extends Promise<infer T> ? T : never;
+  let tx: any;
   try {
     tx = await server.transactions().transaction(txHash).call() as any;
   } catch (err: any) {
