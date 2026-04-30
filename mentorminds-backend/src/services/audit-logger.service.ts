@@ -39,6 +39,48 @@ export class AuditLoggerService {
     return rows;
   }
 
+  async search(filters: {
+    action?: string;
+    actor?: string;
+    since?: Date;
+    until?: Date;
+    limit?: number;
+  }): Promise<AuditLogRecord[]> {
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    let paramIndex = 1;
+
+    if (filters.action !== undefined) {
+      conditions.push(`action = $${paramIndex++}`);
+      values.push(filters.action);
+    }
+    if (filters.actor !== undefined) {
+      conditions.push(`actor = $${paramIndex++}`);
+      values.push(filters.actor);
+    }
+    if (filters.since !== undefined) {
+      conditions.push(`created_at >= $${paramIndex++}`);
+      values.push(filters.since);
+    }
+    if (filters.until !== undefined) {
+      conditions.push(`created_at <= $${paramIndex++}`);
+      values.push(filters.until);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    values.push(filters.limit ?? 100);
+
+    const { rows } = await this.pool.query<AuditLogRecord>(
+      `SELECT id, action, actor, details, created_at
+       FROM audit_logs
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT $${paramIndex}`,
+      values,
+    );
+    return rows;
+  }
+
   /**
    * Searches audit log entries with optional filters.
    * Uses $N placeholders for all parameters including LIMIT and OFFSET.

@@ -75,6 +75,7 @@ const stubSoroban: SorobanEscrowService = {
   createEscrow: jest.fn(),
   openDispute: jest.fn().mockResolvedValue({ txHash: "dispute-tx-hash" }),
   resolveDispute: jest.fn().mockResolvedValue({ txHash: "resolve-tx-hash" }),
+  refund: jest.fn().mockResolvedValue({ txHash: "refund-tx-hash" }),
 };
 
 describe("EscrowApiService.validateStateTransition", () => {
@@ -199,13 +200,49 @@ describe("EscrowApiService state-changing methods use validateStateTransition", 
     );
   });
 
-  it("refundEscrow succeeds from funded", async () => {
+  it("refundEscrow succeeds from funded when called by mentor", async () => {
     const repo = new InMemoryEscrowRepo();
     repo.seed([makeRecord("esc-1", "funded")]);
     const service = new EscrowApiService(repo, stubSoroban);
 
-    const result = await service.refundEscrow("esc-1");
+    const result = await service.refundEscrow("esc-1", "mentor-1");
     expect(result.status).toBe("refunded");
+    expect(stubSoroban.refund).toHaveBeenCalledWith({
+      escrowId: "esc-1",
+      refundedBy: "mentor-1",
+    });
+  });
+
+  it("refundEscrow throws when called by unauthorized user (not mentor)", async () => {
+    const repo = new InMemoryEscrowRepo();
+    repo.seed([makeRecord("esc-1", "funded")]);
+    const service = new EscrowApiService(repo, stubSoroban);
+
+    await expect(service.refundEscrow("esc-1", "not-the-mentor")).rejects.toThrow(
+      "Unauthorized: only the mentor can trigger a refund"
+    );
+    
+    const escrow = await repo.findById("esc-1");
+    expect(escrow?.status).toBe("funded");
+  });
+
+  it("refundEscrow rolls back DB status when on-chain call fails", async () => {
+    const repo = new InMemoryEscrowRepo();
+    repo.seed([makeRecord("esc-1", "funded")]);
+    
+    const failingSoroban: SorobanEscrowService = {
+      ...stubSoroban,
+      refund: jest.fn().mockRejectedValue(new Error("On-chain refund error")),
+    };
+    
+    const service = new EscrowApiService(repo, failingSoroban);
+
+    await expect(service.refundEscrow("esc-1", "mentor-1")).rejects.toThrow(
+      "Failed to refund escrow on-chain for esc-1: On-chain refund error"
+    );
+    
+    const escrow = await repo.findById("esc-1");
+    expect(escrow?.status).toBe("funded");
   });
 
   it("refundEscrow throws when escrow is disputed (must go through admin resolution)", async () => {
@@ -213,7 +250,7 @@ describe("EscrowApiService state-changing methods use validateStateTransition", 
     repo.seed([makeRecord("esc-1", "disputed")]);
     const service = new EscrowApiService(repo, stubSoroban);
 
-    await expect(service.refundEscrow("esc-1")).rejects.toThrow(
+    await expect(service.refundEscrow("esc-1", "mentor-1")).rejects.toThrow(
       "Cannot refund escrow in disputed status"
     );
   });
@@ -223,7 +260,7 @@ describe("EscrowApiService state-changing methods use validateStateTransition", 
     repo.seed([makeRecord("esc-1", "pending")]);
     const service = new EscrowApiService(repo, stubSoroban);
 
-    await expect(service.refundEscrow("esc-1")).rejects.toThrow(
+    await expect(service.refundEscrow("esc-1", "mentor-1")).rejects.toThrow(
       "Cannot refund escrow in pending status"
     );
   });
@@ -233,7 +270,7 @@ describe("EscrowApiService state-changing methods use validateStateTransition", 
     repo.seed([makeRecord("esc-1", "released")]);
     const service = new EscrowApiService(repo, stubSoroban);
 
-    await expect(service.refundEscrow("esc-1")).rejects.toThrow(
+    await expect(service.refundEscrow("esc-1", "mentor-1")).rejects.toThrow(
       "Cannot refund escrow in released status"
     );
   });
@@ -306,6 +343,7 @@ describe("EscrowApiService state-changing methods use validateStateTransition", 
       createEscrow: jest.fn(),
       openDispute: jest.fn().mockRejectedValue(new Error("On-chain error")),
       resolveDispute: jest.fn(),
+      refund: jest.fn(),
     };
     
     const service = new EscrowApiService(repo, failingSoroban);
