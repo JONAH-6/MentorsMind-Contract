@@ -1,4 +1,12 @@
 import { HorizonStreamService } from "../src/services/horizon-stream.service";
+import { paymentTrackerService } from "../src/services/payment-tracker.service";
+
+jest.mock("../src/services/payment-tracker.service", () => ({
+  paymentTrackerService: { findPending: jest.fn() },
+}));
+jest.mock("../src/services/event-indexer.service", () => ({
+  eventIndexerService: { getCursorState: jest.fn(), saveEvent: jest.fn(), updateCursorState: jest.fn() },
+}));
 
 describe("HorizonStreamService", () => {
   const originalPlatform = process.env.PLATFORM_STELLAR_ACCOUNT;
@@ -43,5 +51,64 @@ describe("HorizonStreamService", () => {
 
     const service = new HorizonStreamService();
     expect(service.getPlatformAccounts()).toEqual(["GAAA", "GBBB", "GCC"]);
+  });
+});
+
+describe("HorizonStreamService.processPaymentOperation — amount matching (#199)", () => {
+  const service = new HorizonStreamService();
+  const mockFindPending = paymentTrackerService.findPending as jest.Mock;
+
+  const basePending = {
+    id: "p1",
+    senderAddress: "GSENDER",
+    receiverAddress: "GRECEIVER",
+    status: "pending" as const,
+    txHash: null,
+    amount: "100",
+    assetCode: "XLM",
+    fee: null,
+    ledgerSequence: null,
+    errorCode: null,
+    errorMessage: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it.each([
+    ["100.0000000", "Stellar 7-decimal format matches DB integer string"],
+    ["100.00",      "2-decimal format matches"],
+    ["100",         "exact match"],
+    ["99.9999999",  "within tolerance"],
+  ])("amount %s — %s", async (stellarAmount) => {
+    mockFindPending.mockResolvedValue([basePending]);
+    // Should NOT call alertOnLargeIncomingTransaction (no console.warn)
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await service.processPaymentOperation(
+      { from: "GSENDER", to: "GRECEIVER", amount: stellarAmount, asset: "XLM" },
+      "GRECEIVER"
+    );
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("mismatched amount triggers large-payment alert", async () => {
+    mockFindPending.mockResolvedValue([{ ...basePending, amount: "200" }]);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Use an amount above the default threshold (10000) to trigger the alert
+    await service.processPaymentOperation(
+      { from: "GSENDER", to: "GRECEIVER", amount: "15000.0000000", asset: "XLM" },
+      "GRECEIVER"
+    );
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("ALERT"),
+      expect.anything()
+    );
+    warnSpy.mockRestore();
   });
 });

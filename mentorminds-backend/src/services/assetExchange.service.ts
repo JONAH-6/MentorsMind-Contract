@@ -6,7 +6,7 @@
 
 import { AssetCode } from '../types/asset.types';
 import { exchangeRateService } from './exchange-rate.service';
-import { acquireDistributedLock } from './redis.service';
+import { cacheService } from './cache.service';
 
 const REFRESH_INTERVAL_MS = 60_000; // 60 seconds
 const LOCK_KEY = 'mm:exchange:refresh:lock';
@@ -21,6 +21,10 @@ const TRACKED_PAIRS: Array<[AssetCode, AssetCode]> = [
 ];
 
 let refreshHandle: ReturnType<typeof setInterval> | null = null;
+
+function quoteKey(quoteId: string): string {
+  return `mm:quote:${quoteId}`;
+}
 
 async function refresh(): Promise<void> {
   const acquired = await acquireDistributedLock(LOCK_KEY, LOCK_TTL_SECONDS);
@@ -57,4 +61,28 @@ export function stopRateRefresh(): void {
     refreshHandle = null;
     console.log('[AssetExchangeService] Rate refresh stopped');
   }
+}
+
+/**
+ * Validate and consume a quote (single-use enforcement).
+ *
+ * Deletes the quote from cache immediately after successful validation so
+ * the same quoteId cannot be replayed to initiate multiple payments.
+ *
+ * @param quoteId - The quote ID to validate
+ * @returns The validated quote object
+ * @throws Error('Quote expired or not found') if the quote is missing or expired
+ */
+export function validateQuote<T>(quoteId: string): T {
+  const key = quoteKey(quoteId);
+  const quote = cacheService.get<T>(key);
+
+  if (!quote) {
+    throw Object.assign(new Error('Quote expired or not found'), { statusCode: 400 });
+  }
+
+  // CRITICAL: delete immediately to make quotes single-use and prevent replay attacks
+  cacheService.del(key);
+
+  return quote;
 }

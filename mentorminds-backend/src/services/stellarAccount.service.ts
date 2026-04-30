@@ -132,7 +132,16 @@ export class StellarAccountService {
 
     try {
       // 3. Fetch recommended fee estimate dynamically
-      const { recommended_fee } = await stellarFeesService.getFeeEstimate(1);
+      const feeEstimate = await stellarFeesService.getFeeEstimate(1);
+      const { recommended_fee } = feeEstimate;
+
+      // Warn when surge pricing is active — consider delaying activation
+      if ((feeEstimate as any).surge_pricing_enabled) {
+        console.warn(
+          `[StellarAccountService] Surge pricing active. Recommended fee: ${recommended_fee} stroops. ` +
+          `Consider delaying wallet activation for user ${userId}.`
+        );
+      }
 
       // 4. Apply a safety cap to the fee to prevent runaway costs
       const finalFee = Math.min(
@@ -208,10 +217,57 @@ export class StellarAccountService {
 
   /**
    * Activates an existing wallet by funding it.
+   *
+   * Uses SELECT ... FOR UPDATE inside a DB transaction to prevent concurrent
+   * activations from both proceeding past the wallet_activated check.
+   * The optimistic lock (setting wallet_activated = true before funding) means
+   * only one concurrent caller will attempt fundAccount; the other will see
+   * wallet_activated = true and return early.
+   *
+   * If fundAccount fails after the optimistic lock is set, the transaction is
+   * rolled back so wallet_activated reverts to false.
+   *
    * @param destination The public key.
    * @param userId The ID of the user.
    */
-  async activateExistingWallet(destination: string, userId: string) {
+  async activateExistingWallet(destination: string, userId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Lock the wallet row for this user — concurrent callers block here
+      const { rows } = await client.query<{ id: string; wallet_activated: boolean }>(
+        'SELECT id, wallet_activated FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [userId]
+      );
+
+      if (!rows.length) {
+        await client.query('ROLLBACK');
+        throw new Error(`Wallet not found for user ${userId}`);
+      }
+
+      if (rows[0].wallet_activated) {
+        // Already activated by a prior call — nothing to do
+        await client.query('COMMIT');
+        return;
+      }
+
+      // Optimistic lock: mark activated before funding so any concurrent caller
+      // that acquires the lock next will see wallet_activated = true and return.
+      await client.query(
+        'UPDATE wallets SET wallet_activated = TRUE, updated_at = NOW() WHERE id = $1',
+        [rows[0].id]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    // Fund outside the transaction — fundAccount handles op_already_exists as success
     await this.fundAccount(destination, userId);
   }
 

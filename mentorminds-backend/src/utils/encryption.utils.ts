@@ -80,6 +80,14 @@ export async function logKeysetVersion(): Promise<void> {
  */
 export async function encrypt(plaintext: string): Promise<string> {
   const keyset = await getKeyset();
+  return encryptWithKeyset(plaintext, keyset);
+}
+
+/**
+ * Encrypts using a pre-fetched keyset — avoids repeated getKeyset() calls
+ * when encrypting multiple fields in a single request.
+ */
+export function encryptWithKeyset(plaintext: string, keyset: Keyset): string {
   const key = keyset.keys[keyset.currentVersion];
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv) as crypto.CipherGCM;
