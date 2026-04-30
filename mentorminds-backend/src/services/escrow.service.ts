@@ -40,6 +40,34 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
+/** Error codes that are permanent contract/protocol rejections — never retry. */
+const NON_RETRYABLE_CODES = new Set([
+  'tx_bad_auth',
+  'tx_insufficient_balance',
+  'tx_no_source_account',
+  'tx_bad_auth_extra',
+  'op_underfunded',
+  'op_src_no_trust',
+  'op_not_authorized',
+  'op_no_destination',
+  'op_no_trust',
+  'op_line_full',
+  'op_no_issuer',
+]);
+
+function extractResultCode(err: unknown): string | undefined {
+  const e = err as any;
+  return (
+    e?.response?.data?.extras?.result_codes?.transaction ??
+    e?.response?.data?.extras?.result_codes?.operations?.[0]
+  );
+}
+
+/**
+ * Retries only the submit step. Builds and signs the transaction once before
+ * the loop. On tx_bad_seq (sequence number stale), re-fetches the account and
+ * rebuilds before the next attempt. Throws immediately on non-retryable codes.
+ */
 async function withRetry<T>(
   fn: (signal: AbortSignal) => Promise<T>,
   retries: number = MAX_RETRIES,
@@ -53,7 +81,56 @@ async function withRetry<T>(
     } catch (err) {
       controller.abort();
       lastError = err;
+      const code = extractResultCode(err);
+      if (code && NON_RETRYABLE_CODES.has(code)) {
+        throw err;
+      }
       if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
+type BuildTxFn = () => Promise<ReturnType<typeof TransactionBuilder.prototype.build> & { sign(kp: any): void }>;
+
+/**
+ * Builds and signs the transaction once, then retries only sendTransaction.
+ * On tx_bad_seq the transaction is rebuilt (fresh sequence number) before
+ * the next attempt.
+ */
+async function submitWithRetry(
+  buildAndSign: BuildTxFn,
+  server: rpc.Server,
+  timeoutMs: number,
+  retries: number = MAX_RETRIES,
+  delayMs: number = RETRY_DELAY_MS
+): Promise<Awaited<ReturnType<rpc.Server['sendTransaction']>>> {
+  let transaction = await buildAndSign();
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const sendResponse = await withTimeout(
+        server.sendTransaction(transaction),
+        timeoutMs,
+        'sendTransaction'
+      ) as Awaited<ReturnType<rpc.Server['sendTransaction']>>;
+      return sendResponse;
+    } catch (err) {
+      lastError = err;
+      const code = extractResultCode(err);
+
+      if (code && NON_RETRYABLE_CODES.has(code)) {
+        throw err;
+      }
+
+      if (attempt < retries) {
+        if (code === 'tx_bad_seq') {
+          // Sequence number is stale — rebuild with a fresh account snapshot
+          transaction = await buildAndSign();
+        }
         await new Promise((r) => setTimeout(r, delayMs));
       }
     }
@@ -96,41 +173,32 @@ export class AdminEscrowService {
     // }
     // ── End authorization guard ────────────────────────────────────────────
 
-    return withRetry(async (_signal) => {
+    const buildAndSign = async () => {
       const sourceAccount = await withTimeout(
         this.server.getAccount(this.adminKeypair.publicKey()),
         RPC_TIMEOUT_MS,
         'getAccount'
       );
-
-      const operation = this.contract.call(
-        'release_funds',
-        nativeToScVal(releasedBy, { type: 'address' }),
-        nativeToScVal(escrowId, { type: 'u64' })
-      );
-
-      const transaction = new TransactionBuilder(sourceAccount, {
+      const tx = new TransactionBuilder(sourceAccount, {
         fee: '1000',
         networkPassphrase: Networks.TESTNET,
       })
-        .addOperation(operation)
+        .addOperation(this.contract.call(
+          'release_funds',
+          nativeToScVal(releasedBy, { type: 'address' }),
+          nativeToScVal(escrowId, { type: 'u64' })
+        ))
         .setTimeout(60)
         .build();
+      tx.sign(this.adminKeypair);
+      return tx;
+    };
 
-      transaction.sign(this.adminKeypair);
-
-      const sendResponse = await withTimeout(
-        this.server.sendTransaction(transaction),
-        RPC_TIMEOUT_MS,
-        'sendTransaction'
-      ) as Awaited<ReturnType<typeof this.server.sendTransaction>>;
-
-      if (sendResponse.status !== 'PENDING') {
-        throw new Error(`Failed to send transaction: ${sendResponse.status}`);
-      }
-
-      return sendResponse.hash;
-    });
+    const sendResponse = await submitWithRetry(buildAndSign, this.server, RPC_TIMEOUT_MS);
+    if (sendResponse.status !== 'PENDING') {
+      throw new Error(`Failed to send transaction: ${sendResponse.status}`);
+    }
+    return sendResponse.hash;
   }
 
   /**
@@ -146,74 +214,57 @@ export class AdminEscrowService {
       throw new Error(`mentorPct must be an integer between 0 and 100, got: ${mentorPct}`);
     }
 
-    return withRetry(async (_signal) => {
+    const buildAndSign = async () => {
       const sourceAccount = await withTimeout(
         this.server.getAccount(this.adminKeypair.publicKey()),
         RPC_TIMEOUT_MS,
         'getAccount'
       );
-
-      const operation = this.contract.call(
-        'resolve_dispute',
-        nativeToScVal(escrowId, { type: 'u64' }),
-        nativeToScVal(mentorPct, { type: 'u32' })
-      );
-
-      const transaction = new TransactionBuilder(sourceAccount, {
+      const tx = new TransactionBuilder(sourceAccount, {
         fee: '1000',
         networkPassphrase: Networks.TESTNET,
       })
-        .addOperation(operation)
+        .addOperation(this.contract.call(
+          'resolve_dispute',
+          nativeToScVal(escrowId, { type: 'u64' }),
+          nativeToScVal(mentorPct, { type: 'u32' })
+        ))
         .setTimeout(60)
         .build();
+      tx.sign(this.adminKeypair);
+      return tx;
+    };
 
-      transaction.sign(this.adminKeypair);
-
-      const sendResponse = await withTimeout(
-        this.server.sendTransaction(transaction),
-        RPC_TIMEOUT_MS,
-        'sendTransaction'
-      ) as Awaited<ReturnType<typeof this.server.sendTransaction>>;
-
-      if (sendResponse.status !== 'PENDING') {
-        throw new Error(`Failed to send transaction: ${sendResponse.status}`);
-      }
-
-      return sendResponse.hash;
-    });
+    const sendResponse = await submitWithRetry(buildAndSign, this.server, RPC_TIMEOUT_MS);
+    if (sendResponse.status !== 'PENDING') {
+      throw new Error(`Failed to send transaction: ${sendResponse.status}`);
+    }
+    return sendResponse.hash;
   }
 
   async refund(escrowId: number): Promise<string> {
-    return withRetry(async (_signal) => {
+    const buildAndSign = async () => {
       const sourceAccount = await withTimeout(
         this.server.getAccount(this.adminKeypair.publicKey()),
         RPC_TIMEOUT_MS,
         'getAccount'
       );
-
-      const operation = this.contract.call(
-        'refund',
-        nativeToScVal(escrowId, { type: 'u64' })
-      );
-
-      const transaction = new TransactionBuilder(sourceAccount, {
+      const tx = new TransactionBuilder(sourceAccount, {
         fee: '1000',
         networkPassphrase: Networks.TESTNET,
       })
-        .addOperation(operation)
+        .addOperation(this.contract.call(
+          'refund',
+          nativeToScVal(escrowId, { type: 'u64' })
+        ))
         .setTimeout(60)
         .build();
+      tx.sign(this.adminKeypair);
+      return tx;
+    };
 
-      transaction.sign(this.adminKeypair);
-
-      const res = await withTimeout(
-        this.server.sendTransaction(transaction),
-        RPC_TIMEOUT_MS,
-        'sendTransaction'
-      ) as Awaited<ReturnType<typeof this.server.sendTransaction>>;
-
-      return res.hash;
-    });
+    const res = await submitWithRetry(buildAndSign, this.server, RPC_TIMEOUT_MS);
+    return res.hash;
   }
 }
 
@@ -278,6 +329,15 @@ export class SorobanEscrowService {
       throw new Error(`Deadline must be in the future. Got: ${input.deadline}, now: ${nowSeconds}`);
     }
 
+    // FIX #291: Normalize currency to uppercase and validate against supported assets.
+    // Soroban contracts are case-sensitive — passing 'xlm' when the contract expects
+    // 'XLM' causes the contract to reject the call or create an unreleasable escrow.
+    const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
+    const currency = input.currency.toUpperCase();
+    if (!(SUPPORTED_ASSETS as readonly string[]).includes(currency)) {
+      throw new Error(`Unsupported currency "${currency}". Supported: ${SUPPORTED_ASSETS.join(', ')}`);
+    }
+
     // Generate unique escrow ID to prevent duplicate ID errors on re-escrow
     const escrowId = this.generateEscrowId(input.bookingId, input.escrowId);
 
@@ -290,7 +350,7 @@ export class SorobanEscrowService {
       nativeToScVal(input.learnerId, { type: 'string' }),
       nativeToScVal(input.mentorId, { type: 'string' }),
       nativeToScVal(input.amount, { type: 'i128' }),
-      nativeToScVal(input.currency, { type: 'string' }),
+      nativeToScVal(currency, { type: 'string' }),
       nativeToScVal(input.deadline, { type: 'u64' })
     );
 

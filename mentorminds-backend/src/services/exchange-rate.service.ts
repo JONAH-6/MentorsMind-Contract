@@ -199,6 +199,7 @@ import { AssetCode } from '../types/asset.types';
  */
 interface CacheEntry {
   rate: number;
+  availableLiquidity?: number;
   timestamp: number;
   ttl: number;
 }
@@ -222,10 +223,13 @@ interface CacheStatus {
 /**
  * Asset issuer addresses on the Stellar network.
  * Used to construct order book queries for non-native assets.
+ * Automatically uses correct issuers based on STELLAR_NETWORK env var.
  */
+import { getAssetIssuer } from '../config/asset.config';
+
 const ASSET_ISSUERS: Record<Exclude<AssetCode, 'XLM'>, string> = {
-  USDC: 'GBBD47UZQ2BNSE7E2CMML7BNPI5BEFF2KE5FIXEDISSUERADDRESS',
-  PYUSD: 'GDZ55LVXECRTW4G36ICJVWCIHL7BQUM2FixedIssuerAddress',
+  USDC: getAssetIssuer('USDC') as string,
+  PYUSD: getAssetIssuer('PYUSD') as string,
 };
 
 /**
@@ -267,70 +271,103 @@ class ExchangeRateService {
   }
 
   /**
-   * Query the Stellar Horizon API for an order book to determine exchange rate.
-   * Fetches the best bid/ask prices and calculates an effective rate.
+   * Query the Stellar Horizon API for an order book and calculate a
+   * volume-weighted average price (VWAP) for the given send amount.
+   * Fetches up to 10 levels of depth to account for order book liquidity.
    *
    * @param fromAsset - The source asset code
    * @param toAsset - The destination asset code
-   * @returns The exchange rate as a decimal number
+   * @param sendAmount - The amount being sent (used for VWAP calculation)
+   * @returns Object with VWAP rate and total available liquidity
+   * @throws Error if the API request fails or no trading path exists
+   */
+  private async _fetchRateFromDex(
+    fromAsset: AssetCode,
+    toAsset: AssetCode,
+    sendAmount: number
+  ): Promise<{ rate: number; availableLiquidity: number }> {
+    // Build order book query parameters with depth of 10
+    const params = new URLSearchParams();
+
+    if (fromAsset === 'XLM') {
+      params.append('selling_asset_type', 'native');
+    } else {
+      params.append('selling_asset_type', 'credit_alphanum12');
+      params.append('selling_asset_code', fromAsset);
+      params.append('selling_asset_issuer', ASSET_ISSUERS[fromAsset as Exclude<AssetCode, 'XLM'>]);
+    }
+
+    if (toAsset === 'XLM') {
+      params.append('buying_asset_type', 'native');
+    } else {
+      params.append('buying_asset_type', 'credit_alphanum12');
+      params.append('buying_asset_code', toAsset);
+      params.append('buying_asset_issuer', ASSET_ISSUERS[toAsset as Exclude<AssetCode, 'XLM'>]);
+    }
+
+    params.append('limit', '10');
+
+    const url = `${this.horizonUrl}/order_book?${params.toString()}`;
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`Horizon API error: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    const asks: Array<{ price: string; amount: string }> = data.asks ?? [];
+
+    if (asks.length === 0) {
+      throw new Error(`No trading path available for ${fromAsset}/${toAsset}`);
+    }
+
+    // Calculate VWAP: walk the order book filling `sendAmount` units
+    let remainingAmount = sendAmount;
+    let weightedPriceSum = 0;
+    let availableLiquidity = 0;
+
+    for (const ask of asks) {
+      const askPrice = parseFloat(ask.price);
+      const askAmount = parseFloat(ask.amount);
+
+      if (isNaN(askPrice) || askPrice <= 0 || isNaN(askAmount)) continue;
+
+      availableLiquidity += askAmount;
+      const filled = Math.min(remainingAmount, askAmount);
+      weightedPriceSum += filled * askPrice;
+      remainingAmount -= filled;
+
+      if (remainingAmount <= 0) break;
+    }
+
+    if (weightedPriceSum <= 0) {
+      throw new Error(`Invalid exchange rate received from order book for ${fromAsset}/${toAsset}`);
+    }
+
+    // If order book depth was insufficient, VWAP covers only what was available
+    const filledAmount = sendAmount - Math.max(remainingAmount, 0);
+    const rate = weightedPriceSum / filledAmount;
+
+    return { rate, availableLiquidity };
+  }
+
+  /**
+   * Query the Stellar Horizon API for an order book to determine exchange rate.
+   * Uses VWAP over 10 levels of order book depth for the given send amount.
+   *
+   * @param fromAsset - The source asset code
+   * @param toAsset - The destination asset code
+   * @param sendAmount - The amount being sent (used for VWAP; defaults to 1)
+   * @returns Object with VWAP rate and available liquidity
    * @throws Error if the API request fails or no trading path exists
    */
   private async queryHorizonAPI(
     fromAsset: AssetCode,
-    toAsset: AssetCode
-  ): Promise<number> {
+    toAsset: AssetCode,
+    sendAmount: number = 1
+  ): Promise<{ rate: number; availableLiquidity: number }> {
     try {
-      // Build order book query parameters
-      const params = new URLSearchParams();
-
-      // Set selling asset (fromAsset)
-      if (fromAsset === 'XLM') {
-        params.append('selling_asset_type', 'native');
-      } else {
-        params.append('selling_asset_type', 'credit_alphanum12');
-        params.append('selling_asset_code', fromAsset);
-        params.append('selling_asset_issuer', ASSET_ISSUERS[fromAsset as Exclude<AssetCode, 'XLM'>]);
-      }
-
-      // Set buying asset (toAsset)
-      if (toAsset === 'XLM') {
-        params.append('buying_asset_type', 'native');
-      } else {
-        params.append('buying_asset_type', 'credit_alphanum12');
-        params.append('buying_asset_code', toAsset);
-        params.append('buying_asset_issuer', ASSET_ISSUERS[toAsset as Exclude<AssetCode, 'XLM'>]);
-      }
-
-      const url = `${this.horizonUrl}/order_book?${params.toString()}`;
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        throw new Error(
-          `Horizon API error: ${response.status} ${response.statusText}`
-        );
-      }
-
-      const data = await response.json();
-
-      // Check if there are any asks (sellers willing to sell toAsset for fromAsset)
-      if (!data.asks || data.asks.length === 0) {
-        throw new Error(
-          `No trading path available for ${fromAsset}/${toAsset}`
-        );
-      }
-
-      // Use the best ask price (lowest price at which someone will sell)
-      // The price is in terms of: 1 unit of selling_asset = price units of buying_asset
-      const bestAsk = data.asks[0];
-      const rate = parseFloat(bestAsk.price);
-
-      if (isNaN(rate) || rate <= 0) {
-        throw new Error(
-          `Invalid exchange rate received: ${bestAsk.price}`
-        );
-      }
-
-      return rate;
+      return await this._fetchRateFromDex(fromAsset, toAsset, sendAmount);
     } catch (error) {
       if (error instanceof Error) {
         throw error;
@@ -342,40 +379,44 @@ class ExchangeRateService {
   /**
    * Fetch the exchange rate for an asset pair with caching.
    * Returns cached rate if available and valid, otherwise queries Horizon API.
+   * Uses VWAP over order book depth for the given send amount.
    *
    * @param fromAsset - The source asset code
    * @param toAsset - The destination asset code
-   * @returns The exchange rate as a decimal number (e.g., 0.0875 for 1 XLM = 0.0875 USDC)
+   * @param sendAmount - The amount being sent (used for VWAP calculation; defaults to 1)
+   * @returns Object with rate and availableLiquidity
    * @throws Error if the API request fails or no trading path exists
    */
   async fetchExchangeRate(
     fromAsset: AssetCode,
-    toAsset: AssetCode
-  ): Promise<number> {
+    toAsset: AssetCode,
+    sendAmount: number = 1
+  ): Promise<{ rate: number; availableLiquidity: number }> {
     // Same asset always has rate of 1
     if (fromAsset === toAsset) {
-      return 1;
+      return { rate: 1, availableLiquidity: Infinity };
     }
 
     const cacheKey = this.getCacheKey(fromAsset, toAsset);
     const cached = this.cache.get(cacheKey);
 
-    // Return cached rate if valid
+    // Return cached rate if valid (cache stores the top-of-book rate for warm-up)
     if (cached && this.isCacheValid(cached)) {
-      return cached.rate;
+      return { rate: cached.rate, availableLiquidity: cached.availableLiquidity ?? 0 };
     }
 
-    // Fetch fresh rate from API
-    const rate = await this.queryHorizonAPI(fromAsset, toAsset);
+    // Fetch fresh rate from API using VWAP for the given send amount
+    const { rate, availableLiquidity } = await this.queryHorizonAPI(fromAsset, toAsset, sendAmount);
 
     // Store in cache with 60-second TTL
     this.cache.set(cacheKey, {
       rate,
+      availableLiquidity,
       timestamp: Date.now(),
       ttl: 60000, // 60 seconds
     });
 
-    return rate;
+    return { rate, availableLiquidity };
   }
 
   /**
@@ -423,24 +464,26 @@ class ExchangeRateService {
    * More efficient than calling fetchExchangeRate multiple times.
    *
    * @param pairs - Array of [fromAsset, toAsset] tuples to fetch
-   * @returns Map with cache keys as keys and rates as values
+   * @param sendAmount - The amount being sent (used for VWAP; defaults to 1)
+   * @returns Map with cache keys as keys and rate objects as values
    * @throws Error if any API request fails
    */
   async fetchMultipleRates(
-    pairs: Array<[AssetCode, AssetCode]>
-  ): Promise<Map<string, number>> {
+    pairs: Array<[AssetCode, AssetCode]>,
+    sendAmount: number = 1
+  ): Promise<Map<string, { rate: number; availableLiquidity: number }>> {
     const promises = pairs.map(([from, to]) =>
-      this.fetchExchangeRate(from, to).then((rate) => ({
+      this.fetchExchangeRate(from, to, sendAmount).then((result) => ({
         key: this.getCacheKey(from, to),
-        rate,
+        result,
       }))
     );
 
     const results = await Promise.all(promises);
-    const ratesMap = new Map<string, number>();
+    const ratesMap = new Map<string, { rate: number; availableLiquidity: number }>();
 
-    for (const { key, rate } of results) {
-      ratesMap.set(key, rate);
+    for (const { key, result } of results) {
+      ratesMap.set(key, result);
     }
 
     return ratesMap;
