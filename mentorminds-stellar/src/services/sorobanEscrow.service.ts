@@ -14,6 +14,12 @@ export interface ReleaseFundsParams {
   releasedBy: string;
 }
 
+export interface RefundParams {
+  escrowId: number;
+  /** The caller's address — must match the escrow's mentor field. */
+  refundedBy: string;
+}
+
 /**
  * SorobanEscrowService wraps on-chain escrow interactions that require
  * a signed transaction (e.g. release_funds).
@@ -98,6 +104,54 @@ export class SorobanEscrowService {
     const sendResponse = await this.server.sendTransaction(transaction);
     if (sendResponse.status !== 'PENDING') {
       throw new Error(`Failed to send release_funds transaction: ${sendResponse.status}`);
+    }
+
+    return sendResponse.hash;
+  }
+
+  /**
+   * Refund escrow funds back to the learner.
+   *
+   * Before invoking the contract this method fetches the escrow record from
+   * the chain and asserts that `refundedBy` matches `escrow.mentor`.
+   * This is the primary authorization guard — it prevents unauthorized users
+   * (like a mentee cancelling their own booking) from triggering a refund
+   * without mentor approval.
+   *
+   * @throws {Error} if the escrow is not found, or if `refundedBy` is not
+   *   the escrow's mentor.
+   */
+  async refund({ escrowId, refundedBy }: RefundParams): Promise<string> {
+    // --- Defense-in-depth: verify caller is the escrow's mentor ---
+    const escrow = await this.escrowService.getEscrow(escrowId);
+
+    if (escrow.mentor !== refundedBy) {
+      throw new Error(
+        `Unauthorized: refundedBy (${refundedBy}) does not match escrow mentor (${escrow.mentor})`,
+      );
+    }
+    // ----------------------------------------------------------------
+
+    const sourceAccount = await this.server.getAccount(this.signerKeypair.publicKey());
+
+    const operation = this.contract.call(
+      'refund',
+      nativeToScVal(escrowId, { type: 'u64' }),
+    );
+
+    const transaction = new TransactionBuilder(sourceAccount, {
+      fee: '1000',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    transaction.sign(this.signerKeypair);
+
+    const sendResponse = await this.server.sendTransaction(transaction);
+    if (sendResponse.status !== 'PENDING') {
+      throw new Error(`Failed to send refund transaction: ${sendResponse.status}`);
     }
 
     return sendResponse.hash;

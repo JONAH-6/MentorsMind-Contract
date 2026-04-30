@@ -168,17 +168,40 @@ export class EscrowApiService {
     return this.escrowRepository.updateStatus(escrowId, "released");
   }
 
-  async refundEscrow(escrowId: string): Promise<EscrowRecord> {
+  async refundEscrow(escrowId: string, userId: string): Promise<EscrowRecord> {
     const escrow = await this.escrowRepository.findById(escrowId);
     if (!escrow) {
       throw new Error(`Escrow ${escrowId} not found`);
     }
+
+    // Auth check: only the mentor can trigger a refund via the API
+    if (escrow.mentorId !== userId) {
+      throw new Error(`Unauthorized: only the mentor can trigger a refund`);
+    }
+
     if (!EscrowApiService.validateStateTransition(escrow.status, "refunded")) {
       throw new Error(
         `Cannot refund escrow in ${escrow.status} status`
       );
     }
-    return this.escrowRepository.updateStatus(escrowId, "refunded");
+
+    // Update DB status to refunded first
+    const updatedEscrow = await this.escrowRepository.updateStatus(escrowId, "refunded");
+
+    try {
+      await this.sorobanEscrowService.refund({
+        escrowId,
+        refundedBy: userId,
+      });
+    } catch (error) {
+      // On-chain call failed, rollback DB status
+      await this.escrowRepository.updateStatus(escrowId, escrow.status);
+      throw new Error(
+        `Failed to refund escrow on-chain for ${escrowId}: ${(error as Error).message}`
+      );
+    }
+
+    return updatedEscrow;
   }
 
   async openDispute(
