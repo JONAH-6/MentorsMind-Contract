@@ -18,6 +18,14 @@ export interface EscrowRecord {
   createdAt: Date;
   stellarTxHash: string | null;
   sorobanContractVersion: string | null;
+  mentorPayoutAmount: string | null;
+  learnerRefundAmount: string | null;
+}
+
+export interface TransactionRecord {
+  escrowId: string;
+  type: "mentor_payout" | "refund";
+  amount: string;
 }
 
 export interface EscrowRepository {
@@ -37,26 +45,40 @@ export interface EscrowRepository {
     status?: string
   ): Promise<{ escrows: EscrowRecord[]; total: number }>;
   findById(id: string): Promise<EscrowRecord | null>;
-  updateStatus(id: string, status: EscrowStatus): Promise<EscrowRecord>;
+  updateStatus(id: string, status: EscrowStatus, splits?: { mentorPayoutAmount: string; learnerRefundAmount: string }): Promise<EscrowRecord>;
+  createTransaction(record: TransactionRecord): Promise<void>;
+}
+
+export interface WalletRepository {
+  findByUserId(userId: string): Promise<{ stellarPublicKey: string } | null>;
 }
 
 export interface SorobanEscrowService {
-  createEscrow(input: {
-    escrowId: string;
-    mentorId: string;
-    learnerId: string;
-    amount: string;
-  }): Promise<{ txHash: string; contractVersion: string | null }>;
-  
-  openDispute(input: {
-    escrowId: string;
-    raisedBy: string;
-    reason: string;
-  }): Promise<{ txHash: string }>;
-  
-  resolveDispute(input: {
-    escrowId: string;
-  }): Promise<{ txHash: string }>;
+    createEscrow(input: {
+        escrowId: string;
+        mentorId: string;
+        learnerId: string;
+        amount: string;
+    }): Promise<{ txHash: string; contractVersion: string | null }>;
+    
+    openDispute(input: {
+        escrowId: string;
+        raisedBy: string;
+        reason: string;
+    }): Promise<{ txHash: string }>;
+    
+    resolveDispute(input: {
+        escrowId: string;
+    }): Promise<{ txHash: string }>;
+    
+    releaseFunds(input: {
+        escrowId: string;
+        releasedBy: string;
+    }): Promise<string>;
+}
+
+export interface AdminWalletRepository {
+  getStellarPublicKey(adminUserId: string): Promise<string | null>;
 }
 
 const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
@@ -64,7 +86,8 @@ const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
 export class EscrowApiService {
   constructor(
     private readonly escrowRepository: EscrowRepository,
-    private readonly sorobanEscrowService: SorobanEscrowService
+    private readonly sorobanEscrowService: SorobanEscrowService,
+    private readonly adminWalletRepository?: AdminWalletRepository
   ) {}
 
   /**
@@ -81,7 +104,7 @@ export class EscrowApiService {
     const validTransitions: Record<EscrowStatus, EscrowStatus[]> = {
       pending: ["funded"],
       funded: ["released", "disputed", "refunded"],
-      disputed: ["resolved", "partial_refund"],   // partial_refund allowed from disputed
+      disputed: ["resolved", "partial_refund"],   // partial_refund is a valid dispute resolution
       released: [],
       refunded: [],
       partial_refund: [],
@@ -92,6 +115,7 @@ export class EscrowApiService {
 
   async createEscrow(input: {
     id: string;
+    bookingId: string;
     mentorId: string;
     learnerId: string;
     amount: string;
@@ -119,6 +143,7 @@ export class EscrowApiService {
     try {
       const chainResult = await this.sorobanEscrowService.createEscrow({
         escrowId: created.id,
+        bookingId: input.bookingId,
         mentorId: created.mentorId,
         learnerId: created.learnerId,
         amount: created.amount,
@@ -154,17 +179,40 @@ export class EscrowApiService {
     return this.escrowRepository.updateStatus(escrowId, "released");
   }
 
-  async refundEscrow(escrowId: string): Promise<EscrowRecord> {
+  async refundEscrow(escrowId: string, userId: string): Promise<EscrowRecord> {
     const escrow = await this.escrowRepository.findById(escrowId);
     if (!escrow) {
       throw new Error(`Escrow ${escrowId} not found`);
     }
+
+    // Auth check: only the mentor can trigger a refund via the API
+    if (escrow.mentorId !== userId) {
+      throw new Error(`Unauthorized: only the mentor can trigger a refund`);
+    }
+
     if (!EscrowApiService.validateStateTransition(escrow.status, "refunded")) {
       throw new Error(
         `Cannot refund escrow in ${escrow.status} status`
       );
     }
-    return this.escrowRepository.updateStatus(escrowId, "refunded");
+
+    // Update DB status to refunded first
+    const updatedEscrow = await this.escrowRepository.updateStatus(escrowId, "refunded");
+
+    try {
+      await this.sorobanEscrowService.refund({
+        escrowId,
+        refundedBy: userId,
+      });
+    } catch (error) {
+      // On-chain call failed, rollback DB status
+      await this.escrowRepository.updateStatus(escrowId, escrow.status);
+      throw new Error(
+        `Failed to refund escrow on-chain for ${escrowId}: ${(error as Error).message}`
+      );
+    }
+
+    return updatedEscrow;
   }
 
   async openDispute(
@@ -209,8 +257,9 @@ export class EscrowApiService {
 
   async resolveDispute(
     escrowId: string,
+    adminUserId: string,
     options?: {
-      /** Percentage (0–100) of escrow amount paid to mentor. 0 = full refund, 100 = full release, 1–99 = partial split. */
+      resolution?: "release_to_mentor" | "refund_to_learner";
       splitPercentage?: number;
     }
   ): Promise<EscrowRecord> {
@@ -218,35 +267,57 @@ export class EscrowApiService {
     if (!escrow) {
       throw new Error(`Escrow ${escrowId} not found`);
     }
-    if (!EscrowApiService.validateStateTransition(escrow.status, "resolved") &&
-        !EscrowApiService.validateStateTransition(escrow.status, "partial_refund")) {
+    if (escrow.status !== "disputed") {
       throw new Error(
         `Cannot resolve dispute for escrow in ${escrow.status} status`
       );
     }
 
-    const splitPct = options?.splitPercentage ?? 100;
-    if (!Number.isInteger(splitPct) || splitPct < 0 || splitPct > 100) {
-      throw new Error('splitPercentage must be an integer between 0 and 100');
+    // Determine mentor's share percentage (0–100)
+    const splitPct =
+      options?.splitPercentage !== undefined
+        ? options.splitPercentage
+        : options?.resolution === "release_to_mentor"
+        ? 100
+        : 0;
+
+    if (splitPct < 0 || splitPct > 100) {
+      throw new Error("splitPercentage must be between 0 and 100");
     }
 
-    if (splitPct >= 1 && splitPct <= 99) {
-      // Partial split: record both payout amounts and set status to partial_refund
-      const total = parseFloat(escrow.amount);
-      const mentorAmount = ((total * splitPct) / 100).toFixed(7);
-      const learnerAmount = ((total * (100 - splitPct)) / 100).toFixed(7);
+    // A split between 1–99 is a partial refund; 0 or 100 is a full resolution
+    const newStatus: EscrowStatus =
+      splitPct > 0 && splitPct < 100 ? "partial_refund" : "resolved";
 
-      console.info(
-        `[EscrowApiService] Partial resolution for ${escrowId}: ` +
-        `mentor ${mentorAmount} (${splitPct}%), learner ${learnerAmount} (${100 - splitPct}%)`
-      );
+    // Calculate split amounts using integer arithmetic to avoid float dust
+    const totalStroops = Math.round(parseFloat(escrow.amount) * 1e7);
+    const mentorStroops = Math.floor((totalStroops * splitPct) / 100);
+    const learnerStroops = totalStroops - mentorStroops;
+    const mentorPayoutAmount = (mentorStroops / 1e7).toFixed(7);
+    const learnerRefundAmount = (learnerStroops / 1e7).toFixed(7);
 
-      return this.escrowRepository.updateStatus(escrowId, "partial_refund");
+    const updatedEscrow = await this.escrowRepository.updateStatus(escrowId, newStatus, {
+      mentorPayoutAmount,
+      learnerRefundAmount,
+    });
+
+    // Record both sides of the split as separate transaction entries
+    if (mentorStroops > 0) {
+      await this.escrowRepository.createTransaction({
+        escrowId,
+        type: "mentor_payout",
+        amount: mentorPayoutAmount,
+      });
+    }
+    if (learnerStroops > 0) {
+      await this.escrowRepository.createTransaction({
+        escrowId,
+        type: "refund",
+        amount: learnerRefundAmount,
+      });
     }
 
-    // 0% to mentor = full refund to learner; 100% = full release to mentor
-    const finalStatus: EscrowStatus = splitPct === 0 ? "refunded" : "resolved";
-    return this.escrowRepository.updateStatus(escrowId, finalStatus);
+    return updatedEscrow;
   }
 
   async findUnreconciledEscrows(

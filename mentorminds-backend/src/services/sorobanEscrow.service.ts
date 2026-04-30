@@ -116,17 +116,48 @@ if (typeof (SorobanRpc as any).assembleTransaction !== 'function') {
 export class StellarSorobanClient {
   private readonly rpcServer: SorobanRpc.Server;
   private readonly networkPassphrase: string;
+  private readonly rpcTimeoutMs: number;
 
   constructor(
     private readonly feesService: Pick<StellarFeesService, "getFeeEstimate">,
     rpcUrl?: string,
     network?: string
   ) {
+    const sdkAny = SorobanRpc as any;
+    const RpcServerCtor = sdkAny.Server ?? sdkAny.SorobanRpc?.Server ?? sdkAny.rpc?.Server ?? null;
+
+    if (!RpcServerCtor) {
+      throw new Error(
+        '@stellar/stellar-sdk does not support Soroban RPC. Upgrade to v11+'
+      );
+    }
+
     const url = rpcUrl || process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
     const networkType = network || process.env.STELLAR_NETWORK || 'testnet';
-    
-    this.rpcServer = new SorobanRpc.Server(url, { allowHttp: url.startsWith("http://") });
+
+    this.rpcServer = new RpcServerCtor(url, { allowHttp: url.startsWith("http://") });
     this.networkPassphrase = networkType === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+    this.rpcTimeoutMs = parseInt(process.env.SOROBAN_RPC_TIMEOUT_MS || '10000', 10);
+  }
+
+  /** Wraps an RPC promise with a timeout to prevent indefinite hangs. */
+  private withRpcTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`RPC timeout after ${this.rpcTimeoutMs}ms: ${label}`)),
+          this.rpcTimeoutMs
+        )
+      ),
+    ]);
+  }
+
+  /**
+   * Returns true only when both the contract address and the RPC client are configured.
+   */
+  isConfigured(): boolean {
+    return this.rpcServer !== null && !!process.env.SOROBAN_ESCROW_CONTRACT_ADDRESS;
   }
 
   /**
@@ -134,7 +165,10 @@ export class StellarSorobanClient {
    * Should be called at startup to prevent network mismatch issues.
    */
   async verifyNetworkPassphrase(): Promise<void> {
-    const networkInfo = await this.rpcServer.getNetwork();
+    const networkInfo = await this.withRpcTimeout(
+      this.rpcServer.getNetwork(),
+      'getNetwork'
+    );
     if (networkInfo.passphrase !== this.networkPassphrase) {
       throw new Error(
         `SOROBAN_RPC_URL network passphrase does not match STELLAR_NETWORK configuration. ` +
@@ -161,7 +195,10 @@ export class StellarSorobanClient {
     const startTime = Date.now();
     
     while (Date.now() - startTime < timeoutMs) {
-      const txResponse = await this.rpcServer.getTransaction(txHash);
+      const txResponse = await this.withRpcTimeout(
+        this.rpcServer.getTransaction(txHash),
+        'getTransaction'
+      );
       
       if (txResponse.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
         return txResponse;
@@ -193,7 +230,10 @@ export class StellarSorobanClient {
    */
   async invoke(preparedTx: any): Promise<TransactionResult> {
     // Submit transaction
-    const sendResponse = await this.rpcServer.sendTransaction(preparedTx);
+    const sendResponse = await this.withRpcTimeout(
+      this.rpcServer.sendTransaction(preparedTx),
+      'sendTransaction'
+    );
     
     if (!sendResponse?.hash) {
       throw new Error('Transaction submission failed: no hash returned');
@@ -247,6 +287,20 @@ export class StellarSorobanClient {
     }
     return { fee: String(baseFee) };
   }
+}
+
+/**
+ * Extracts the escrow ID from a Soroban contract transaction result.
+ * Returns null if the result shape is unexpected — callers must throw, never fall back.
+ */
+export function extractEscrowIdFromResult(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  // Handle common result shapes from Soroban SDK
+  if (typeof r['escrowId'] === 'string' && r['escrowId']) return r['escrowId'];
+  if (typeof r['escrow_id'] === 'string' && r['escrow_id']) return r['escrow_id'];
+  if (typeof r['id'] === 'string' && r['id']) return r['id'];
+  return null;
 }
 
 /**
@@ -428,8 +482,16 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
     // const client = new StellarSorobanClient(feesService);
     // await client.verifyNetworkPassphrase();
     // const preparedTx = await prepareCreateEscrowTx({ ... });
-    // const result = await client.invoke(preparedTx);
-    // return { txHash: result.txHash, contractVersion: this.resolvedContractVersion };
+    // const tx = await client.invoke(preparedTx);
+    //
+    // const escrowId = extractEscrowIdFromResult(tx.result);
+    // if (!escrowId) {
+    //   console.error('[SorobanEscrow] create_escrow succeeded but returned no escrow ID', { result: tx.result });
+    //   throw new Error(
+    //     `create_escrow succeeded but returned no escrow ID. Raw result: ${JSON.stringify(tx.result)}`
+    //   );
+    // }
+    // return { txHash: tx.txHash, contractVersion: this.resolvedContractVersion };
 
     throw new Error(
       "SorobanEscrowServiceImpl: contract invocation not yet wired up"
@@ -471,6 +533,7 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
 
   async resolveDispute(input: {
     escrowId: string;
+    resolvedBy: string;
   }): Promise<{ txHash: string }> {
     if (this.expectedContractVersion && !this.configured) {
       throw Object.assign(
@@ -490,6 +553,40 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
 
     throw new Error(
       "SorobanEscrowServiceImpl: resolveDispute not yet wired up"
+    );
+  }
+
+  async releaseFunds(input: {
+    escrowId: string;
+    releasedBy: string;
+  }): Promise<string> {
+    // Import required classes
+    const { BookingRecord, BookingRepository } = await import('./types');
+
+    // Validate input
+    if (!input.escrowId || !input.releasedBy) {
+      throw Object.assign(
+        new Error("Escrow ID and releasedBy are required"),
+        { statusCode: 400 }
+      );
+    }
+
+    // Check if service is configured
+    if (this.expectedContractVersion && !this.configured) {
+      throw Object.assign(
+        new Error(
+          "Soroban escrow integration disabled due to contract version mismatch"
+        ),
+        { statusCode: 503 }
+      );
+    }
+
+    // Fetch escrow record from database to verify learner
+    // Note: In a real implementation, we would use the escrowRepository
+    // For now, we'll simulate the check by throwing if not wired up
+    // TODO: Replace this with actual repository lookup when available
+    throw new Error(
+      "SorobanEscrowServiceImpl: releaseFunds not yet wired up - needs escrowRepository to verify learnerId matches releasedBy"
     );
   }
 
@@ -527,22 +624,50 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
    * Omitting 'pending' means timeout refunds on pending bookings are never
    * reflected in the DB.
    * 
-   * @deprecated Use syncPendingEscrowsOptimized instead
    */
+  private _syncRunning = false;
+
   async syncPendingEscrows(
     bookingRepo: BookingRepository,
     escrowStateResolver: EscrowStateResolver
   ): Promise<void> {
-    const bookings = await bookingRepo.findBookingsWithActiveEscrow([
-      "pending",
-      "confirmed",
-      "completed",
-      "cancelled",
-    ]);
+    // Mutex: skip if a sync cycle is already in progress
+    if (this._syncRunning) {
+      console.warn('[EscrowSync] Skipping sync — previous cycle still running');
+      return;
+    }
+    this._syncRunning = true;
+    const startTime = Date.now();
 
-    for (const booking of bookings) {
-      const state = await escrowStateResolver.getEscrowState(booking.escrowId);
-      await this.applyEscrowStateToBookings(state, booking.id, bookingRepo);
+    try {
+      const bookings = await bookingRepo.findBookingsWithActiveEscrow([
+        "pending",
+        "confirmed",
+        "completed",
+        "cancelled",
+      ]);
+
+      const BATCH_SIZE = 10;
+      for (let i = 0; i < bookings.length; i += BATCH_SIZE) {
+        const batch = bookings.slice(i, i + BATCH_SIZE);
+        await Promise.allSettled(
+          batch.map(async (booking) => {
+            try {
+              const state = await escrowStateResolver.getEscrowState(booking.escrowId);
+              await this.applyEscrowStateToBookings(state, booking.id, bookingRepo);
+            } catch (err) {
+              console.error(`[EscrowSync] Failed to sync booking ${booking.id}:`, err);
+            }
+          })
+        );
+      }
+
+      const duration = Date.now() - startTime;
+      if (duration > 25_000) {
+        console.warn(`[EscrowSync] Sync took ${duration}ms — approaching polling interval`);
+      }
+    } finally {
+      this._syncRunning = false;
     }
   }
 
