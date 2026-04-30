@@ -73,12 +73,17 @@ export interface SorobanEscrowService {
     }): Promise<string>;
 }
 
+export interface AdminWalletRepository {
+  getStellarPublicKey(adminUserId: string): Promise<string | null>;
+}
+
 const SUPPORTED_ASSETS = ['XLM', 'USDC', 'PYUSD'] as const;
 
 export class EscrowApiService {
   constructor(
     private readonly escrowRepository: EscrowRepository,
-    private readonly sorobanEscrowService: SorobanEscrowService
+    private readonly sorobanEscrowService: SorobanEscrowService,
+    private readonly adminWalletRepository?: AdminWalletRepository
   ) {}
 
   /**

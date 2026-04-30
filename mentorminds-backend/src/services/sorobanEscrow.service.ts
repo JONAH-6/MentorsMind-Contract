@@ -533,6 +533,7 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
 
   async resolveDispute(input: {
     escrowId: string;
+    resolvedBy: string;
   }): Promise<{ txHash: string }> {
     if (this.expectedContractVersion && !this.configured) {
       throw Object.assign(
