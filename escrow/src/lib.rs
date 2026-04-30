@@ -635,18 +635,30 @@ impl EscrowContract {
         Self::_do_release(&env, &mut escrow, &key, gross);
     }
 
-    /// Open a dispute (called by mentor or learner).
+    /// Release funds for one session in a multi-session package escrow.
     ///
-    /// - `reason`: a short symbol describing the dispute (e.g. `symbol_short!("NO_SHOW")`).
-    ///   Stored on the escrow for admin review.
+    /// Called by the learner (or admin) after each session is completed.
+    /// Releases `amount / total_sessions` to the mentor (fee-adjusted).
+    /// On the final session, sets status to `Released`.
     ///
     /// Panics if:
-    /// - Escrow does not exist.
-    /// - Escrow is not `Active`.
-    /// - Caller is neither mentor nor learner.
-    pub fn dispute(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
-        let key = (symbol_short!("ESCROW"), escrow_id);
+    /// - Escrow does not exist or is not `Active`.
+    /// - All sessions have already been released.
+    /// - Caller is neither the learner nor the admin.
+    pub fn release_partial(env: Env, caller: Address, escrow_id: u64) {
+        let key = (ESCROW_SYM, escrow_id);
         env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow not active");
+        }
+
         if escrow.sessions_completed >= escrow.total_sessions {
             panic!("All sessions already released");
         }

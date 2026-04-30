@@ -8,8 +8,11 @@ const mockSign = jest.fn();
 const mockBuild = jest.fn(() => ({
   sign: mockSign,
 }));
-const mockAddOperation = jest.fn(() => ({
+const mockSetTimeout = jest.fn(() => ({
   build: mockBuild,
+}));
+const mockAddOperation = jest.fn(() => ({
+  setTimeout: mockSetTimeout,
 }));
 const mockTransactionBuilderCtor = jest.fn(() => ({
   addOperation: mockAddOperation,
@@ -66,8 +69,7 @@ describe('AdminEscrowService', () => {
     expect(hash).toBe('tx-resolve-123');
     expect(mockFromSecret).toHaveBeenCalledWith('SADMINSECRET');
     expect(mockContractCtor).toHaveBeenCalledWith('contract-id');
-    expect(mockServerCtor).toHaveBeenCalledWith('https://rpc.test');
-    expect(mockGetLatestLedger).toHaveBeenCalledTimes(1);
+    expect(mockServerCtor).toHaveBeenCalledWith('https://rpc.test', expect.objectContaining({ timeout: 10000 }));
     expect(mockGetAccount).toHaveBeenCalledWith('GADMINPUBLICKEY');
     expect(mockContractCall).toHaveBeenCalledWith('resolve_dispute', 42, 100);
     expect(mockTransactionBuilderCtor).toHaveBeenCalledWith(
@@ -91,9 +93,9 @@ describe('AdminEscrowService', () => {
 
     const service = new AdminEscrowService('contract-id', 'https://rpc.test', 'SADMINSECRET');
 
-    await expect(service.resolveDispute(7, 0)).rejects.toThrow(
-      'Failed to send transaction: ERROR'
-    );
+    await expect(service.resolveDispute(7, 0)).rejects.toThrow('Failed to send transaction: ERROR');
+    // Non-PENDING status is checked after submitWithRetry returns — throws immediately, no retry
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
   });
 
   test('resolveDispute validates percentage is integer between 0-100', async () => {

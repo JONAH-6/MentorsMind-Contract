@@ -1,5 +1,5 @@
 import { pool } from '../config/database';
-import { EncryptionUtil } from '../utils/encryption.utils';
+import * as EncryptionUtil from '../utils/encryption.utils';
 
 export interface UserPrivate {
   id: string;
@@ -28,6 +28,13 @@ function mapPrivateRow(row: Record<string, unknown>): UserPrivate {
   };
 }
 
+export interface UserUpdatePayload {
+  phoneNumber?: string;
+  address?: string;
+  dateOfBirth?: string;
+  nationalId?: string;
+}
+
 export class UsersService {
   async findById(id: string): Promise<UserPrivate | null> {
     const { rows } = await pool.query(
@@ -36,6 +43,40 @@ export class UsersService {
     );
     if (rows.length === 0) return null;
     return mapPrivateRow(rows[0]);
+  }
+
+  async update(id: string, payload: UserUpdatePayload): Promise<void> {
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    let idx = 1;
+
+    // Fetch keyset once — avoids N sequential secret-resolution calls for N PII fields
+    const keyset = await EncryptionUtil.getKeyset();
+
+    if (payload.phoneNumber !== undefined) {
+      fields.push(`phone_number_encrypted = $${idx++}`);
+      values.push(EncryptionUtil.encryptWithKeyset(payload.phoneNumber, keyset));
+    }
+    if (payload.address !== undefined) {
+      fields.push(`address_encrypted = $${idx++}`);
+      values.push(EncryptionUtil.encryptWithKeyset(payload.address, keyset));
+    }
+    if (payload.dateOfBirth !== undefined) {
+      fields.push(`date_of_birth_encrypted = $${idx++}`);
+      values.push(EncryptionUtil.encryptWithKeyset(payload.dateOfBirth, keyset));
+    }
+    if (payload.nationalId !== undefined) {
+      fields.push(`national_id_encrypted = $${idx++}`);
+      values.push(EncryptionUtil.encryptWithKeyset(payload.nationalId, keyset));
+    }
+
+    if (fields.length === 0) return;
+
+    values.push(id);
+    await pool.query(
+      `UPDATE users SET ${fields.join(', ')} WHERE id = $${idx}`,
+      values
+    );
   }
 }
 

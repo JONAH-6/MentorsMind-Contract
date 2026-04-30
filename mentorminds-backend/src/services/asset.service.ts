@@ -3,35 +3,51 @@
  * Centralized service for managing asset metadata and operations.
  * Provides methods to query asset information, validate asset codes,
  * and format/parse amounts to asset precision.
+ * 
+ * Network-aware: Automatically selects correct issuer addresses based on
+ * STELLAR_NETWORK environment variable (mainnet or testnet).
  */
 
 import { Asset, AssetCode } from '../types/asset.types';
+import { 
+  ASSET_ISSUER_CONFIG, 
+  getAssetIssuer, 
+  getCurrentNetwork,
+  StellarNetwork 
+} from '../config/asset.config';
+
+/**
+ * Build asset metadata record with network-aware issuers.
+ * This function is called at runtime to ensure the correct issuer
+ * addresses are used based on the current network configuration.
+ * 
+ * @param network - Optional network override (defaults to current network from env)
+ * @returns Record of asset metadata with correct issuers for the network
+ */
+function buildAssetMetadata(network?: StellarNetwork): Record<AssetCode, Asset> {
+  const assets: Record<AssetCode, Asset> = {} as Record<AssetCode, Asset>;
+  
+  for (const [code, config] of Object.entries(ASSET_ISSUER_CONFIG)) {
+    const assetCode = code as AssetCode;
+    assets[assetCode] = {
+      code: assetCode,
+      issuer: getAssetIssuer(assetCode, network),
+      decimals: config.decimals,
+      name: config.name,
+    };
+  }
+  
+  return assets;
+}
 
 /**
  * Asset metadata for supported assets on the Stellar network.
  * Includes XLM (native), USDC, and PYUSD with their respective
  * issuers, decimal precision, and display names.
+ * 
+ * Issuers are automatically selected based on STELLAR_NETWORK env var.
  */
-const ASSETS: Record<AssetCode, Asset> = {
-  XLM: {
-    code: 'XLM',
-    issuer: null, // Native asset
-    decimals: 7,
-    name: 'Stellar Lumens',
-  },
-  USDC: {
-    code: 'USDC',
-    issuer: 'GBBD47UZQ2BNSE7E2CMML7BNPI5BEFF2KE5FIXEDISSUERADDRESS',
-    decimals: 6,
-    name: 'USD Coin',
-  },
-  PYUSD: {
-    code: 'PYUSD',
-    issuer: 'GDZ55LVXECRTW4G36ICJVWCIHL7BQUM2FixedIssuerAddress',
-    decimals: 6,
-    name: 'PayPal USD',
-  },
-};
+const ASSETS: Record<AssetCode, Asset> = buildAssetMetadata();
 
 /**
  * AssetService class
@@ -106,6 +122,36 @@ class AssetService {
    */
   isValidAssetCode(code: string): boolean {
     return code === 'XLM' || code === 'USDC' || code === 'PYUSD';
+  }
+
+  /**
+   * Get the current network configuration.
+   * @returns The current network ('mainnet' or 'testnet')
+   */
+  getCurrentNetwork(): StellarNetwork {
+    return getCurrentNetwork();
+  }
+
+  /**
+   * Get asset metadata for a specific network.
+   * Useful for testing or when you need to query assets for a different network.
+   * 
+   * @param assetCode - The asset code
+   * @param network - The target network
+   * @returns Asset metadata with issuer for the specified network
+   */
+  getAssetMetadataForNetwork(assetCode: AssetCode, network: StellarNetwork): Asset {
+    const config = ASSET_ISSUER_CONFIG[assetCode];
+    if (!config) {
+      throw new Error(`Unsupported asset code: ${assetCode}`);
+    }
+
+    return {
+      code: assetCode,
+      issuer: getAssetIssuer(assetCode, network),
+      decimals: config.decimals,
+      name: config.name,
+    };
   }
 }
 
