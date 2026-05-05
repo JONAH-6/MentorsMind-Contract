@@ -15,6 +15,7 @@ import mentorWalletRoutes from "./routes/mentor-wallet.routes";
 import auditLogRoutes from "./routes/audit-log.routes";
 import quoteRoutes from "./routes/quote.routes";
 import escrowSyncRoutes from "./routes/escrow-sync.routes";
+import walletActivationRoutes from "./routes/walletActivation.routes";
 import { startNetworkMonitor, stopNetworkMonitor, getNetworkStatus } from "./services/network-monitor.service";
 import { stopStellarMonitor } from "./services/stellar-monitor.service";
 import { startRateRefresh, stopRateRefresh } from "./services/assetExchange.service";
@@ -45,6 +46,7 @@ app.use("/api/mentor-wallet", mentorWalletRoutes);
 app.use("/api/audit-logs", auditLogRoutes);
 app.use("/api/v1/quotes", quoteRoutes);
 app.use("/api/v1/escrow-sync", escrowSyncRoutes);
+app.use("/api/wallets", walletActivationRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -75,6 +77,7 @@ app.get("/", (req, res) => {
       auditLogs: "/api/audit-logs",
       quotes: "/api/v1/quotes",
       escrowSync: "/api/v1/escrow-sync",
+      wallets: "/api/wallets",
       health: "/health",
       networkStatus: "/api/v1/network/status",
       websocket: "ws://localhost:" + PORT + "/ws/events",
