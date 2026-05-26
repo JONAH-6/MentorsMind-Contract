@@ -127,6 +127,14 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Timelock, &timelock);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "timelock_set"),
+            ),
+            timelock,
+        );
     }
 
     pub fn create_proposal(
@@ -298,10 +306,26 @@ impl GovernanceContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
+            env.events().publish(
+                (
+                    Symbol::new(&env, "governance"),
+                    Symbol::new(&env, "proposal_failed"),
+                    proposal_id,
+                ),
+                (proposal.votes_for, proposal.votes_against, quorum_met),
+            );
             return;
         }
 
         proposal.status = ProposalStatus::Passed;
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "proposal_passed"),
+                proposal_id,
+            ),
+            (proposal.votes_for, proposal.votes_against, quorum_met),
+        );
         Self::apply_action(&env, &proposal.action);
         proposal.status = ProposalStatus::Executed;
         env.storage()
@@ -335,6 +359,15 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "proposal_cancelled"),
+                proposal_id,
+            ),
+            proposal.proposer.clone(),
+        );
     }
 
     pub fn get_proposal(env: Env, id: u32) -> Proposal {
