@@ -23,6 +23,11 @@ pub enum Error {
     LoanAlreadyRepaid = 8,
     NotAdmin = 9,
     InvalidAmount = 10,
+    /// Deposit and withdrawal in the same ledger sequence are forbidden to
+    /// prevent flash-loan-style balance manipulation.
+    SameBlockDepositWithdraw = 11,
+    /// A single address may not borrow more than the per-block cap.
+    PerBlockBorrowLimitExceeded = 12,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +69,19 @@ pub enum DataKey {
     LenderBalance(Address),
     Loan(Address),
     LoanCount,
+    /// Ledger sequence at which a lender last deposited.
+    /// Used to enforce the same-block deposit/withdraw guard.
+    LenderDepositLedger(Address),
+    /// Running borrow total for an address within the current ledger sequence.
+    /// Resets when the ledger sequence advances.
+    BlockBorrowTotal(Address),
+    /// Ledger sequence recorded when the per-block borrow total was last written.
+    BlockBorrowLedger(Address),
+    /// Snapshot of total liquidity at the start of the current ledger sequence.
+    /// Used to detect intra-block balance manipulation.
+    BlockLiquiditySnapshot,
+    /// Ledger sequence when the liquidity snapshot was taken.
+    BlockLiquidityLedger,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +92,10 @@ const INTEREST_RATE_BPS: i128 = 200; // 2% flat fee
 const MIN_CREDIT_SCORE: u32 = 600;
 const LIQUIDATION_DAYS: u64 = 30;
 const LIQUIDATION_SECONDS: u64 = LIQUIDATION_DAYS * 86_400;
+
+/// Maximum amount a single address may borrow within one ledger sequence.
+/// Set to 10% of the pool's liquidity snapshot; enforced dynamically.
+const PER_BLOCK_BORROW_CAP_BPS: i128 = 1_000; // 10 %
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -165,7 +187,14 @@ impl LendingPool {
             .set(&DataKey::LenderBalance(lender.clone()), &lender_balance);
 
         env.events()
-            .publish((symbol_short!("deposited"),), (lender, amount, lp_tokens));
+            .publish((symbol_short!("deposited"),), (lender.clone(), amount, lp_tokens));
+
+        // Record the ledger sequence of this deposit so that same-block
+        // withdrawals can be rejected.
+        env.storage().instance().set(
+            &DataKey::LenderDepositLedger(lender),
+            &env.ledger().sequence(),
+        );
 
         Ok(lp_tokens)
     }
@@ -181,6 +210,18 @@ impl LendingPool {
         }
 
         lender.require_auth();
+
+        // Flash-loan guard: reject withdrawals in the same ledger sequence as
+        // the deposit.  An attacker who deposits and immediately withdraws
+        // within one transaction cannot manipulate pool balances.
+        let deposit_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LenderDepositLedger(lender.clone()))
+            .unwrap_or(0);
+        if deposit_ledger == env.ledger().sequence() {
+            return Err(Error::SameBlockDepositWithdraw);
+        }
 
         let lender_balance: i128 = env
             .storage()
@@ -273,6 +314,74 @@ impl LendingPool {
         if total_liquidity < amount {
             return Err(Error::InsufficientLiquidity);
         }
+
+        // ---------------------------------------------------------------
+        // Flash-loan guard: per-block borrow cap
+        //
+        // Take a snapshot of total liquidity at the start of each new
+        // ledger sequence.  Within a single sequence, cap the cumulative
+        // borrow amount for any one address at PER_BLOCK_BORROW_CAP_BPS
+        // of that snapshot.  This prevents an attacker from draining the
+        // pool in a single transaction by repeatedly borrowing.
+        // ---------------------------------------------------------------
+        let current_seq = env.ledger().sequence();
+
+        // Refresh the liquidity snapshot when the ledger sequence advances.
+        let snap_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BlockLiquidityLedger)
+            .unwrap_or(0);
+        let liquidity_snapshot: i128 = if snap_ledger == current_seq {
+            env.storage()
+                .instance()
+                .get(&DataKey::BlockLiquiditySnapshot)
+                .unwrap_or(total_liquidity)
+        } else {
+            // New ledger sequence — record a fresh snapshot.
+            env.storage()
+                .instance()
+                .set(&DataKey::BlockLiquiditySnapshot, &total_liquidity);
+            env.storage()
+                .instance()
+                .set(&DataKey::BlockLiquidityLedger, &current_seq);
+            total_liquidity
+        };
+
+        // Compute the per-block cap for this borrower.
+        let per_block_cap = liquidity_snapshot
+            .checked_mul(PER_BLOCK_BORROW_CAP_BPS)
+            .unwrap_or(i128::MAX)
+            .checked_div(10_000)
+            .unwrap_or(i128::MAX);
+
+        // Accumulate the borrower's total within this ledger sequence.
+        let borrow_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .unwrap_or(0);
+        let block_total: i128 = if borrow_ledger == current_seq {
+            env.storage()
+                .instance()
+                .get(&DataKey::BlockBorrowTotal(borrower.clone()))
+                .unwrap_or(0)
+        } else {
+            0 // Reset for the new ledger sequence.
+        };
+
+        let new_block_total = block_total.checked_add(amount).unwrap_or(i128::MAX);
+        if new_block_total > per_block_cap {
+            return Err(Error::PerBlockBorrowLimitExceeded);
+        }
+
+        // Persist the updated per-block accumulator.
+        env.storage()
+            .instance()
+            .set(&DataKey::BlockBorrowTotal(borrower.clone()), &new_block_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
 
         // Calculate fee (2% flat)
         let fee = (amount * INTEREST_RATE_BPS) / 10_000;
@@ -377,6 +486,47 @@ impl LendingPool {
             .persistent()
             .get(&DataKey::Loan(borrower))
             .ok_or(Error::LoanNotFound)
+    }
+
+    /// Return the cumulative amount borrowed by `borrower` in the current
+    /// ledger sequence.  Returns 0 if no borrow has occurred this sequence.
+    pub fn get_block_borrow_total(env: Env, borrower: Address) -> i128 {
+        let current_seq = env.ledger().sequence();
+        let borrow_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .unwrap_or(0);
+        if borrow_ledger == current_seq {
+            env.storage()
+                .instance()
+                .get(&DataKey::BlockBorrowTotal(borrower))
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Return the liquidity snapshot taken at the start of the current ledger
+    /// sequence.  This is the reference value used for the per-block borrow cap.
+    pub fn get_liquidity_snapshot(env: Env) -> i128 {
+        let current_seq = env.ledger().sequence();
+        let snap_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BlockLiquidityLedger)
+            .unwrap_or(0);
+        if snap_ledger == current_seq {
+            env.storage()
+                .instance()
+                .get(&DataKey::BlockLiquiditySnapshot)
+                .unwrap_or(0)
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::TotalLiquidity)
+                .unwrap_or(0)
+        }
     }
 
     /// Liquidate overdue loan (admin only)

@@ -21,6 +21,7 @@ mentorminds-reputation = { path = "../contracts/reputation", features = ["testut
 mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"] }
 mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
 mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
+mentorminds-lending-pool = { path = "../contracts/lending_pool", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -39,3 +40,11 @@ path = "state_machine_tests.rs"
 [[test]]
 name = "economic_attacks"
 path = "economic_attacks.rs"
+
+[[test]]
+name = "flash_loan_tests"
+path = "flash_loan_tests.rs"
+
+[[test]]
+name = "oracle_manipulation_tests"
+path = "oracle_manipulation_tests.rs"
