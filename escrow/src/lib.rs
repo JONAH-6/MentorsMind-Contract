@@ -202,6 +202,16 @@ const YIELD_INFO_KEY: Symbol = symbol_short!("YLD_INF");
 const YIELD_DEPLOY_DELAY: u64 = 24 * 60 * 60; // 24 h
 
 // ---------------------------------------------------------------------------
+// Flash-loan protection storage keys
+// ---------------------------------------------------------------------------
+/// Per-escrow ledger sequence at which the escrow was created.
+/// Used to prevent same-block deposit and release/refund.
+const ESCROW_CREATE_LEDGER: Symbol = symbol_short!("ESC_CLED");
+/// Minimum number of ledger sequences that must pass between escrow creation
+/// and any fund movement (release, refund, dispute).
+const MIN_LEDGERS_BEFORE_ACTION: u32 = 1;
+
+// ---------------------------------------------------------------------------
 // Yield types
 // ---------------------------------------------------------------------------
 
@@ -244,8 +254,6 @@ impl EscrowContract {
         admin: Address,
         treasury: Address,
         fee_bps: u32,
-        approved_tokens: soroban_sdk::Vec<Address>,
-        auto_release_delay_secs: u64
         approved_tokens: Vec<Address>,
         auto_release_delay_secs: u64,
     ) {
@@ -267,24 +275,6 @@ impl EscrowContract {
 
         env.storage().persistent().set(&ESCROW_COUNT, &0u64);
         env.storage().persistent().extend_ttl(&ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage()
-            .persistent()
-            .extend_ttl(&ADMIN, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        env.storage().persistent().set(&TREASURY, &treasury);
-        env.storage()
-            .persistent()
-            .extend_ttl(&TREASURY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        env.storage().persistent().set(&FEE_BPS, &fee_bps);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        env.storage().persistent().set(&ESCROW_COUNT, &0u64);
-        env.storage()
-            .persistent()
-            .extend_ttl(&ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         env.storage().persistent().set(&GROUP_ESCROW_COUNT, &0u64);
         env.storage().persistent().extend_ttl(
@@ -309,9 +299,6 @@ impl EscrowContract {
         };
         env.storage().persistent().set(&AUTO_REL_DLY, &delay);
         env.storage().persistent().extend_ttl(&AUTO_REL_DLY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage()
-            .persistent()
-            .extend_ttl(&AUTO_REL_DLY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         for token_addr in approved_tokens.iter() {
             Self::_set_token_approved(&env, &token_addr, true);
@@ -378,85 +365,11 @@ impl EscrowContract {
         amount: i128,
         session_id: Symbol,
         token_address: Address,
-        session_end_time: u64
+        session_end_time: u64,
+        total_sessions: u32,
     ) -> u64 {
-        // --- Validate amount ---
-        if amount <= 0 {
-            panic!("Amount must be greater than zero");
-        }
-
-        // --- Validate approved token ---
-        if !Self::_is_token_approved(&env, &token_address) {
-            panic!("Token not approved");
-        }
-
-        // --- Require learner authorization ---
         learner.require_auth();
 
-        // --- Balance check (SEP-41: balance()) ---
-        let token_client = token::Client::new(&env, &token_address);
-        let learner_balance = token_client.balance(&learner);
-        if learner_balance < amount {
-            panic!("Insufficient token balance");
-        }
-
-        // --- Retrieve global auto-release delay ---
-        let auto_release_delay: u64 = env
-            .storage()
-            .persistent()
-            .get(&AUTO_REL_DLY)
-            .unwrap_or(DEFAULT_AUTO_RELEASE_DELAY);
-        env.storage().persistent().extend_ttl(&AUTO_REL_DLY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        // --- Increment and persist escrow counter ---
-        let mut count: u64 = env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0);
-        count = count.checked_add(1).expect("Counter overflow");
-        env.storage().persistent().set(&ESCROW_COUNT, &count);
-        env.storage().persistent().extend_ttl(&ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        // --- Transfer tokens from learner → contract ---
-        token_client.transfer(&learner, &env.current_contract_address(), &amount);
-
-        // --- Persist escrow ---
-        let escrow = Escrow {
-            id: count,
-            mentor: mentor.clone(),
-            learner: learner.clone(),
-            amount,
-            session_id: session_id.clone(),
-            status: EscrowStatus::Active,
-            created_at: env.ledger().timestamp(),
-            token_address: token_address.clone(),
-            platform_fee: 0,
-            net_amount: 0,
-            session_end_time,
-            auto_release_delay,
-            dispute_reason: symbol_short!(""),
-            resolved_at: 0,
-        };
-
-        let key = (symbol_short!("ESCROW"), count);
-        env.storage().persistent().set(&key, &escrow);
-        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        // --- Emit event (includes token_address and session_end_time) ---
-        env.events().publish(
-            (symbol_short!("created"), count),
-            (mentor, learner, amount, session_id, token_address, session_end_time)
-        );
-
-        count
-    }
-
-    /// Release funds to the mentor (called by learner or admin).
-    ///
-    /// Calculates the platform fee (`gross * fee_bps / 10_000`), transfers the
-    /// fee to the treasury, and transfers the remainder to the mentor.
-    /// Both amounts are stored on the escrow record and emitted in the event.
-    pub fn release_funds(env: Env, caller: Address, escrow_id: u64) {
-        let key = (symbol_short!("ESCROW"), escrow_id);
-        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        learner.require_auth();
         if amount <= 0 {
             panic!("Amount must be greater than zero");
         }
@@ -521,6 +434,18 @@ impl EscrowContract {
             .persistent()
             .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
+        // Flash-loan guard: record the ledger sequence at creation.
+        // release_funds / refund / dispute check this and reject same-block calls.
+        let create_ledger_key = (ESCROW_CREATE_LEDGER, count);
+        env.storage()
+            .persistent()
+            .set(&create_ledger_key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &create_ledger_key,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+
         env.storage().persistent().set(&session_dup_key, &true);
         env.storage().persistent().extend_ttl(
             &session_dup_key,
@@ -581,6 +506,19 @@ impl EscrowContract {
             panic!("Escrow not active");
         }
 
+        // Flash-loan guard: prevent release in the same ledger sequence as
+        // the deposit.  An attacker cannot create an escrow and immediately
+        // release it within a single transaction.
+        let create_ledger_key = (ESCROW_CREATE_LEDGER, escrow_id);
+        let create_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&create_ledger_key)
+            .unwrap_or(0);
+        if create_ledger == env.ledger().sequence() {
+            panic!("same-block deposit and release not allowed");
+        }
+
         let admin: Address = env.storage().persistent().get(&ADMIN).expect("Admin not found");
         env.storage().persistent().extend_ttl(&ADMIN, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
@@ -605,46 +543,6 @@ impl EscrowContract {
     /// - Escrow does not exist.
     /// - Escrow status is not `Active`.
     /// - The auto-release window has not yet elapsed.
-    pub fn try_auto_release(env: Env, escrow_id: u64) {
-        let key = (ESCROW_SYM, escrow_id);
-        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let mut escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Escrow not found");
-
-        if escrow.status != EscrowStatus::Active {
-            panic!("Escrow not active");
-        }
-
-        let now = env.ledger().timestamp();
-        let release_after = escrow
-            .session_end_time
-            .checked_add(escrow.auto_release_delay)
-            .expect("Timestamp overflow");
-
-        if now < release_after {
-            panic!("Auto-release window has not elapsed");
-        }
-
-        env.events().publish((symbol_short!("auto_rel"), escrow_id), (escrow_id, now));
-
-        let gross = escrow.amount;
-        Self::_do_release(&env, &mut escrow, &key, gross);
-    }
-
-    /// Release funds for one session in a multi-session package escrow.
-    ///
-    /// Called by the learner (or admin) after each session is completed.
-    /// Releases `amount / total_sessions` to the mentor (fee-adjusted).
-    /// On the final session, sets status to `Released`.
-    ///
-    /// Panics if:
-    /// - Escrow does not exist or is not `Active`.
-    /// - All sessions have already been released.
-    /// - Caller is neither the learner nor the admin.
     pub fn release_partial(env: Env, caller: Address, escrow_id: u64) {
         let key = (ESCROW_SYM, escrow_id);
         env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
@@ -823,6 +721,19 @@ impl EscrowContract {
             panic!("Escrow not active");
         }
 
+        // Flash-loan guard: prevent dispute in the same ledger sequence as
+        // the deposit.  This stops an attacker from creating an escrow and
+        // immediately disputing it to manipulate fund flows.
+        let create_ledger_key = (ESCROW_CREATE_LEDGER, escrow_id);
+        let create_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&create_ledger_key)
+            .unwrap_or(0);
+        if create_ledger == env.ledger().sequence() {
+            panic!("same-block deposit and dispute not allowed");
+        }
+
         caller.require_auth();
 
         if caller != escrow.mentor && caller != escrow.learner {
@@ -934,6 +845,18 @@ impl EscrowContract {
             panic!("Cannot refund");
         }
 
+        // Flash-loan guard: prevent refund in the same ledger sequence as
+        // the deposit.
+        let create_ledger_key = (ESCROW_CREATE_LEDGER, escrow_id);
+        let create_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&create_ledger_key)
+            .unwrap_or(0);
+        if create_ledger == env.ledger().sequence() {
+            panic!("same-block deposit and refund not allowed");
+        }
+
         let refund_amt = escrow.amount;
         let token_client = token::Client::new(&env, &escrow.token_address);
 
@@ -1013,32 +936,6 @@ impl EscrowContract {
     // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
-
-    pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
-        let key = (symbol_short!("ESCROW"), escrow_id);
-        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage().persistent().get(&key).expect("Escrow not found")
-    }
-
-    pub fn get_escrow_count(env: Env) -> u64 {
-        env.storage().persistent().extend_ttl(&ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0)
-    }
-
-    pub fn get_fee_bps(env: Env) -> u32 {
-        env.storage().persistent().extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage().persistent().get(&FEE_BPS).unwrap_or(0)
-    }
-
-    pub fn get_treasury(env: Env) -> Address {
-        env.storage().persistent().extend_ttl(&TREASURY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage().persistent().get(&TREASURY).expect("Treasury not set")
-    }
-
-    pub fn get_auto_release_delay(env: Env) -> u64 {
-        env.storage().persistent().extend_ttl(&AUTO_REL_DLY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        env.storage().persistent().get(&AUTO_REL_DLY).unwrap_or(DEFAULT_AUTO_RELEASE_DELAY)
-    }
 
     pub fn submit_review(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
         let key = (ESCROW_SYM, escrow_id);
@@ -1315,16 +1212,6 @@ impl EscrowContract {
         );
     }
 
-    fn _set_token_approved(env: &Env, token_address: &Address, approved: bool) {
-        let key = (APPROVED_TOKEN_KEY, token_address.clone());
-        env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-    }
-
-    fn _is_token_approved(env: &Env, token_address: &Address) -> bool {
-        let key = (APPROVED_TOKEN_KEY, token_address.clone());
-        env.storage().persistent().get::<_, bool>(&key).unwrap_or(false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2524,6 +2411,13 @@ mod test {
             .persistent()
             .get(&AUTO_REL_DLY)
             .unwrap_or(DEFAULT_AUTO_RELEASE_DELAY)
+    }
+
+    /// Return the ledger sequence at which escrow `escrow_id` was created.
+    /// Used by flash-loan protection tests to verify the guard is active.
+    pub fn get_escrow_create_ledger(env: Env, escrow_id: u64) -> u32 {
+        let key = (ESCROW_CREATE_LEDGER, escrow_id);
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
     pub fn is_token_approved(env: Env, token_address: Address) -> bool {
