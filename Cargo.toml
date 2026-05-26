@@ -4,6 +4,7 @@ members = [
     "escrow",
     "contracts/allowance",
     "contracts/bounty",
+    "contracts/escrow_factory",
     "contracts/interface_registry",
     "contracts/verification",
     "contracts/oracle",
