@@ -48,3 +48,7 @@ path = "flash_loan_tests.rs"
 [[test]]
 name = "oracle_manipulation_tests"
 path = "oracle_manipulation_tests.rs"
+
+[[test]]
+name = "sig_validation_tests"
+path = "sig_validation_tests.rs"
