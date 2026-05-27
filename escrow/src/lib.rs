@@ -175,6 +175,10 @@ const AUTO_REL_DLY: Symbol = symbol_short!("AR_DELAY");
 /// Contract version for upgrade tracking
 const CONTRACT_VERSION: Symbol = symbol_short!("CONTRACT_VER");
 
+// Fee cache storage keys (instance-level)
+const FEE_CACHE_KEYS: Symbol = symbol_short!("FEE_KEYS");
+const FEE_CACHE_VALS: Symbol = symbol_short!("FEE_VALS");
+
 /// Maximum configurable fee: 10% = 1 000 basis points.
 const SESSION_KEY: Symbol = symbol_short!("SESSION");
 const MENTOR_ESCROWS: Symbol = symbol_short!("MNT_ESC");
@@ -322,6 +326,10 @@ impl EscrowContract {
 
         env.storage().persistent().set(&FEE_BPS, &new_fee_bps);
         env.storage().persistent().extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        // Invalidate fee cache when fee BPS changes.
+        env.storage().instance().set(&FEE_CACHE_KEYS, &Vec::new(&env));
+        env.storage().instance().set(&FEE_CACHE_VALS, &Vec::new(&env));
     }
 
     /// Update the treasury address — admin only.
@@ -340,6 +348,69 @@ impl EscrowContract {
         env.storage().persistent().extend_ttl(&ADMIN, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
         admin.require_auth();
         Self::_set_token_approved(&env, &token_address, approved);
+    }
+
+    /// Internal helper: get cached platform fee for `amount` or compute and
+    /// store it in instance storage. The cache is invalidated when `update_fee`
+    /// is called.
+    fn get_cached_platform_fee(env: &Env, amount: i128) -> i128 {
+        let mut keys: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&FEE_CACHE_KEYS)
+            .unwrap_or(Vec::new(&env));
+        let mut vals: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&FEE_CACHE_VALS)
+            .unwrap_or(Vec::new(&env));
+
+        let mut i = 0;
+        while i < keys.len() {
+            if keys.get(i).unwrap() == amount {
+                return vals.get(i).unwrap();
+            }
+            i += 1;
+        }
+
+        // Read current fee bps and extend its TTL
+        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
+        env.storage()
+            .persistent()
+            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let platform_fee: i128 = amount
+            .checked_mul(fee_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+
+        keys.push_back(amount);
+        vals.push_back(platform_fee);
+        env.storage().instance().set(&FEE_CACHE_KEYS, &keys);
+        env.storage().instance().set(&FEE_CACHE_VALS, &vals);
+
+        platform_fee
+    }
+
+    /// Clear the escrow fee cache (administrative / programmatic invalidation).
+    pub fn clear_fee_cache(env: Env) {
+        env.storage()
+            .instance()
+            .set(&FEE_CACHE_KEYS, &Vec::new(&env));
+        env.storage()
+            .instance()
+            .set(&FEE_CACHE_VALS, &Vec::new(&env));
+    }
+
+    /// Return current fee cache length (observability/test helper).
+    pub fn fee_cache_len(env: Env) -> u32 {
+        let keys: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&FEE_CACHE_KEYS)
+            .unwrap_or(Vec::new(&env));
+        keys.len()
     }
 
     // -----------------------------------------------------------------------
@@ -584,16 +655,8 @@ impl EscrowContract {
                 .expect("Division error")
         };
 
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = amount_to_release
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+        // Compute platform fee (cached) and net amount
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, amount_to_release);
         let net_amount: i128 = amount_to_release
             .checked_sub(platform_fee)
             .expect("Underflow");
@@ -1160,17 +1223,8 @@ impl EscrowContract {
             .checked_mul(group.learners.len() as i128)
             .expect("overflow");
 
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = gross
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
-        let net_amount: i128 = escrow.amount.checked_sub(platform_fee).expect("Underflow");
+        // Compute platform fee using the cache and derive net amount
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, gross);
         let net_amount: i128 = gross.checked_sub(platform_fee).expect("Underflow");
 
         let treasury: Address = env
@@ -2281,17 +2335,8 @@ mod test {
             .get(milestone_index as u32)
             .unwrap();
 
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = milestone
-            .amount
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+        // Compute platform fee using cached helper
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, milestone.amount);
         let net_amount: i128 = milestone
             .amount
             .checked_sub(platform_fee)
@@ -2765,17 +2810,8 @@ mod test {
                 );
             }
         }
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        // Fee is applied only on the principal (gross), not on yield.
-        let platform_fee: i128 = gross
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+        // Compute platform fee (cached) on principal only (gross), not on yield.
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, gross);
         let net_amount: i128 = gross.checked_sub(platform_fee).expect("Underflow");
 
         let treasury: Address = env
