@@ -188,6 +188,21 @@ impl ReputationContract {
             .get(&DataKey::Review(session_id))
             .expect("Review not found")
     }
+
+
+    pub fn calculate_average_rating(env: Env, user: Address) -> u32 {
+        let key = (symbol_short!("AvgRating"), user.clone());
+        env.storage().persistent().get(&key).unwrap_or(0u32)
+    }
+    
+    pub fn update_reputation(env: Env, user: Address, new_rating: u32) {
+        let key = (symbol_short!("AvgRating"), user.clone());
+        let current: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
+        let updated = if current == 0 { new_rating } else { (current + new_rating) / 2 };
+        env.storage().persistent().set(&key, &updated);
+        env.events().publish((symbol_short!("Reputation"), symbol_short!("updated")), (user, updated));
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

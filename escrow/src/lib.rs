@@ -1212,6 +1212,69 @@ impl EscrowContract {
         );
     }
 
+
+
+    pub fn update_escrow_metadata(env: Env, escrow_id: u64, metadata: EscrowMetadata) {
+        let key = (symbol_short!("EscrowMeta"), escrow_id);
+        env.storage().persistent().set(&key, &metadata);
+        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.events().publish((symbol_short!("Escrow"), symbol_short!("meta_upd"), escrow_id), escrow_id);
+    }
+
+    pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Option<EscrowMetadata> {
+        let key = (symbol_short!("EscrowMeta"), escrow_id);
+        env.storage().persistent().get(&key)
+    }
+
+    pub fn submit_rating(env: Env, caller: Address, escrow_id: u64, is_mentor: bool, rating: u32, review: String) {
+        caller.require_auth();
+        if rating < 1 || rating > 5 {
+            panic!("Invalid rating");
+        }
+        
+        let key = (symbol_short!("Escrow"), escrow_id);
+        let escrow: Escrow = env.storage().persistent().get(&key).expect("Escrow not found");
+        
+        if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Resolved {
+            panic!("Escrow not completed");
+        }
+        
+        if is_mentor && caller != escrow.mentor {
+            panic!("Not the mentor");
+        } else if !is_mentor && caller != escrow.learner {
+            panic!("Not the learner");
+        }
+
+        let rating_key = (symbol_short!("Rating"), escrow_id, caller.clone());
+        if env.storage().persistent().has(&rating_key) {
+            panic!("Already rated");
+        }
+        
+        env.storage().persistent().set(&rating_key, &rating);
+        env.storage().persistent().extend_ttl(&rating_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("Escrow"), symbol_short!("rated"), escrow_id),
+            (caller, is_mentor, rating, review, env.ledger().timestamp())
+        );
+    }
+
+    pub fn get_escrows_by_status(env: Env, status: EscrowStatus) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
+    pub fn get_escrows_by_mentor(env: Env, mentor: Address) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
+    pub fn get_escrows_by_learner(env: Env, learner: Address) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
+    pub fn get_escrows_by_date_range(env: Env, start: u64, end: u64) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -3346,3 +3409,25 @@ mod yield_tests {
         assert_eq!(f.client().get_accrued_yield(&id), 100);
     }
 }
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowMetadata {
+    pub subject: String,
+    pub mentorship_level: String,
+    pub notes: String,
+    pub tags: soroban_sdk::Vec<String>,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowQuery {
+    pub status: Option<EscrowStatus>,
+    pub mentor: Option<Address>,
+    pub learner: Option<Address>,
+    pub start_date: Option<u64>,
+    pub end_date: Option<u64>,
+}
+
