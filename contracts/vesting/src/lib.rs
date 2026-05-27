@@ -354,13 +354,17 @@ impl VestingContract {
         } else if current_time >= schedule.vesting_end {
             schedule.total
         } else {
-            let vested_period = current_time - schedule.cliff_end;
-            let total_period = schedule.vesting_end - schedule.cliff_end;
-            (schedule.total * vested_period as i128) / total_period as i128
+            let vested_period = current_time.checked_sub(schedule.cliff_end).expect("Underflow");
+            let total_period = schedule.vesting_end.checked_sub(schedule.cliff_end).expect("Underflow");
+            schedule.total
+                .checked_mul(vested_period as i128)
+                .expect("Overflow")
+                .checked_div(total_period as i128)
+                .expect("Division error")
         };
 
-        let unvested_amount = schedule.total - vested_amount;
-        let refund_amount = vested_amount - schedule.claimed;
+        let unvested_amount = schedule.total.checked_sub(vested_amount).expect("Underflow");
+        let refund_amount = vested_amount.checked_sub(schedule.claimed).expect("Underflow");
 
         let token: Address = env
             .storage()

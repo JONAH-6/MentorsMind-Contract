@@ -221,7 +221,7 @@ impl PaymentRouter {
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::EscrowIdCounter, &(counter + 1));
+            .set(&DataKey::EscrowIdCounter, &(counter.checked_add(1).expect("Overflow")));
 
         // Emit payment routed event
         let event = PaymentRoutedEvent {
