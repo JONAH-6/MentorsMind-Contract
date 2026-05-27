@@ -1,4 +1,5 @@
 #![no_std]
+use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Vec,
@@ -1069,7 +1070,7 @@ impl EscrowContract {
             .persistent()
             .get(&GROUP_ESCROW_COUNT)
             .unwrap_or(0);
-        count += 1;
+        count = count.checked_add(1).expect("Overflow");
         env.storage().persistent().set(&GROUP_ESCROW_COUNT, &count);
         env.storage().persistent().extend_ttl(
             &GROUP_ESCROW_COUNT,

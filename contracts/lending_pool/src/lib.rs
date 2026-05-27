@@ -165,7 +165,7 @@ impl LendingPool {
             .instance()
             .get(&DataKey::TotalLiquidity)
             .unwrap_or(0);
-        total_liquidity += amount;
+        total_liquidity = total_liquidity.checked_add(amount).expect("Overflow");
         env.storage()
             .instance()
             .set(&DataKey::TotalLiquidity, &total_liquidity);
@@ -175,7 +175,7 @@ impl LendingPool {
             .instance()
             .get(&DataKey::TotalLpTokens)
             .unwrap_or(0);
-        total_lp += lp_tokens;
+        total_lp = total_lp.checked_add(lp_tokens).expect("Overflow");
         env.storage()
             .instance()
             .set(&DataKey::TotalLpTokens, &total_lp);
@@ -185,7 +185,7 @@ impl LendingPool {
             .persistent()
             .get(&DataKey::LenderBalance(lender.clone()))
             .unwrap_or(0);
-        lender_balance += lp_tokens;
+        lender_balance = lender_balance.checked_add(lp_tokens).expect("Overflow");
         env.storage()
             .persistent()
             .set(&DataKey::LenderBalance(lender.clone()), &lender_balance);
@@ -252,7 +252,7 @@ impl LendingPool {
             .instance()
             .get(&DataKey::TotalLiquidity)
             .unwrap_or(0);
-        total_liquidity -= usdc_amount;
+        total_liquidity = total_liquidity.checked_sub(usdc_amount).expect("Underflow");
         env.storage()
             .instance()
             .set(&DataKey::TotalLiquidity, &total_liquidity);
@@ -262,12 +262,12 @@ impl LendingPool {
             .instance()
             .get(&DataKey::TotalLpTokens)
             .unwrap_or(0);
-        total_lp -= lp_amount;
+        total_lp = total_lp.checked_sub(lp_amount).expect("Underflow");
         env.storage()
             .instance()
             .set(&DataKey::TotalLpTokens, &total_lp);
 
-        let new_balance = lender_balance - lp_amount;
+        let new_balance = lender_balance.checked_sub(lp_amount).expect("Underflow");
         if new_balance == 0 {
             env.storage()
                 .persistent()
@@ -390,6 +390,11 @@ impl LendingPool {
         // Calculate fee (2% flat) using cache for common amounts
         let fee = Self::get_cached_fee(&env, amount);
 
+        // Transfer USDC to borrower FIRST
+        let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let token_client = token::Client::new(&env, &usdc_token);
+        token_client.transfer(&env.current_contract_address(), &borrower, &amount);
+
         // Create loan record
         let now = env.ledger().timestamp();
         let loan = LoanRecord {
@@ -398,7 +403,7 @@ impl LendingPool {
             fee,
             session_id: session_id.clone(),
             borrowed_at: now,
-            due_at: now + LIQUIDATION_SECONDS,
+            due_at: now.checked_add(LIQUIDATION_SECONDS).expect("Timestamp overflow"),
             repaid: false,
         };
 
@@ -406,13 +411,8 @@ impl LendingPool {
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
 
-        // Transfer USDC to borrower
-        let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
-        token_client.transfer(&env.current_contract_address(), &borrower, &amount);
-
         // Update liquidity
-        let new_liquidity = total_liquidity - amount;
+        let new_liquidity = total_liquidity.checked_sub(amount).expect("Underflow");
         env.storage()
             .instance()
             .set(&DataKey::TotalLiquidity, &new_liquidity);
@@ -471,7 +471,7 @@ impl LendingPool {
             .instance()
             .get(&DataKey::TotalLiquidity)
             .unwrap_or(0);
-        total_liquidity += total_owed;
+        total_liquidity = total_liquidity.checked_add(total_owed).expect("Overflow");
         env.storage()
             .instance()
             .set(&DataKey::TotalLiquidity, &total_liquidity);
@@ -556,7 +556,11 @@ impl LendingPool {
         }
 
         // Not found: compute and append to cache
-        let fee = (amount * INTEREST_RATE_BPS) / 10_000;
+        let fee = amount
+            .checked_mul(INTEREST_RATE_BPS)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
         keys.push_back(amount);
         vals.push_back(fee);
 

@@ -153,8 +153,8 @@ impl StakingContract {
         token_client.transfer(&mentor, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        let lock_seconds = (lock_period_days as u64) * 86_400u64;
-        let unlock_at = now + lock_seconds;
+        let lock_seconds = (lock_period_days as u64).checked_mul(86_400u64).expect("Overflow");
+        let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
         let tier = compute_tier(amount);
 
         let record = StakeRecord {
@@ -187,7 +187,7 @@ impl StakingContract {
             .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&DataKey::TotalStaked, &(total_staked + amount));
+            .set(&DataKey::TotalStaked, &(total_staked.checked_add(amount).expect("Overflow")));
 
         env.events().publish(
             (
@@ -262,7 +262,7 @@ impl StakingContract {
             .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&DataKey::TotalStaked, &(total_staked - record.amount));
+            .set(&DataKey::TotalStaked, &(total_staked.checked_sub(record.amount).expect("Underflow")));
 
         env.events().publish(
             (
