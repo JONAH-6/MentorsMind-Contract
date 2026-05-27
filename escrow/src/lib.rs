@@ -1304,20 +1304,18 @@ mod test {
     }
 
     struct TestFixture {
-    pub fn create_milestone_escrow(
         env: Env,
+        contract_id: Address,
+        admin: Address,
         mentor: Address,
         learner: Address,
-        milestones: Vec<MilestoneSpec>,
+        treasury: Address,
         token_address: Address,
     }
 
     impl TestFixture {
         fn setup() -> Self {
             Self::setup_with_fee(500)
-    ) -> u64 {
-        if milestones.is_empty() {
-            panic!("At least one milestone required");
         }
 
         fn setup_with_fee(fee_bps: u32) -> Self {
@@ -1327,7 +1325,7 @@ mod test {
         fn setup_with_fee_and_delay(fee_bps: u32, auto_release_delay_secs: u64) -> Self {
             let env = Env::default();
             env.mock_all_auths();
-            // Advance time so timestamp is not 0
+            // Advance time so timestamp is not 0.
             env.ledger().with_mut(|li| {
                 li.timestamp = 14400;
             });

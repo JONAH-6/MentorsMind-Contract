@@ -181,7 +181,7 @@ impl SubscriptionContract {
             .set(&DataKey::SubCounter, &(sub_id + 1));
 
         env.events().publish(
-            (symbol_short!("subscribed"), plan_id),
+            (symbol_short!("subscrbd"), plan_id),
             (learner, plan.mentor, sub_id),
         );
 

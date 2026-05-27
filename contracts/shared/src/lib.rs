@@ -2,6 +2,10 @@
 
 use soroban_sdk::contracterror;
 
+/// Shared contract primitives reused across multiple Soroban modules.
+///
+/// Centralizing these definitions keeps authorization and state-transition
+/// behavior aligned across contracts that make the same safety assumptions.
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
