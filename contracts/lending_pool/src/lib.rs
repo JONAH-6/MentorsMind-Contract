@@ -3,6 +3,7 @@
 use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,9 @@ pub enum DataKey {
     BlockLiquiditySnapshot,
     /// Ledger sequence when the liquidity snapshot was taken.
     BlockLiquidityLedger,
+    /// Simple fee cache: parallel vectors of amounts and fees
+    FeeCacheKeys,
+    FeeCacheValues,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,8 +387,8 @@ impl LendingPool {
             .instance()
             .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
 
-        // Calculate fee (2% flat)
-        let fee = (amount * INTEREST_RATE_BPS) / 10_000;
+        // Calculate fee (2% flat) using cache for common amounts
+        let fee = Self::get_cached_fee(&env, amount);
 
         // Create loan record
         let now = env.ledger().timestamp();
@@ -529,6 +533,60 @@ impl LendingPool {
         }
     }
 
+    /// Return cached fee for an amount or compute and store it.
+    fn get_cached_fee(env: &Env, amount: i128) -> i128 {
+        // Retrieve parallel vectors from instance storage
+        let mut keys: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeCacheKeys)
+            .unwrap_or(Vec::new(&env));
+        let mut vals: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeCacheValues)
+            .unwrap_or(Vec::new(&env));
+
+        let mut i = 0;
+        while i < keys.len() {
+            if keys.get(i).unwrap() == amount {
+                return vals.get(i).unwrap();
+            }
+            i += 1;
+        }
+
+        // Not found: compute and append to cache
+        let fee = (amount * INTEREST_RATE_BPS) / 10_000;
+        keys.push_back(amount);
+        vals.push_back(fee);
+
+        // Persist updated cache
+        env.storage().instance().set(&DataKey::FeeCacheKeys, &keys);
+        env.storage().instance().set(&DataKey::FeeCacheValues, &vals);
+
+        fee
+    }
+
+    /// Clear the fee cache (cache invalidation).
+    pub fn clear_fee_cache(env: Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCacheKeys, &Vec::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCacheValues, &Vec::new(&env));
+    }
+
+    /// Return the number of cached fee entries (for testing/observability).
+    pub fn fee_cache_len(env: Env) -> u32 {
+        let keys: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeCacheKeys)
+            .unwrap_or(Vec::new(&env));
+        keys.len()
+    }
+
     /// Liquidate overdue loan (admin only)
     pub fn liquidate(env: Env, borrower: Address) -> Result<(), Error> {
         let admin: Address = env
@@ -609,6 +667,9 @@ mod tests {
 
         let result = client.borrow(&borrower, &1000, &session_id);
         assert!(result.is_ok());
+        // Cache should contain the fee for the borrowed amount
+        let cache_len = client.fee_cache_len();
+        assert!(cache_len >= 1);
     }
 
     #[test]
