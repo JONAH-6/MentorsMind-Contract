@@ -276,6 +276,18 @@ impl InsuranceContract {
         ratio > 0 && ratio < COVERAGE_ALERT_BPS
     }
 
+    /// Calculate the premium for a given escrow amount and premium_bps.
+    /// Returns 0 if premium_bps is 0.
+    pub fn calculate_premium(_env: Env, escrow_amount: i128, premium_bps: u32) -> i128 {
+        if premium_bps == 0 {
+            return 0;
+        }
+        escrow_amount
+            .checked_mul(premium_bps as i128)
+            .expect("overflow")
+            / 10_000
+    }
+
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
