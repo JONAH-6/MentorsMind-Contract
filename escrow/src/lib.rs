@@ -4,6 +4,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Add
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    /// Escrow created but funds not yet deposited (pre-funding state).
+    Pending,
     Active,
     Released,
     Disputed,
