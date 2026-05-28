@@ -31,8 +31,12 @@ pub struct StakeRecord {
     pub mentor: Address,
     pub amount: i128,
     pub staked_at: u64,
-    pub unlock_at: u64,
-    pub tier: u32,
+        // Add cooldown_until timestamp to lock out staking after unstake
+        pub unlock_cooldown_until: Option<u64> = None,
+
+        pub tier: u32,
+    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -44,8 +48,12 @@ pub struct StakeRecord {
 pub struct StakedEventData {
     pub mentor: Address,
     pub amount: i128,
-    pub unlock_at: u64,
-    pub tier: u32,
+        // Add cooldown_until timestamp to lock out staking after unstake
+        pub unlock_cooldown_until: Option<u64> = None,
+
+        pub tier: u32,
+    }
+    }
 }
 
 #[contracttype]
