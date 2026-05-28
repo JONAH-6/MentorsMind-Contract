@@ -4,6 +4,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Add
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    /// Escrow created but funds not yet deposited (pre-funding state).
+    Pending,
     Active,
     Released,
     Disputed,
@@ -77,6 +79,7 @@ pub struct Escrow {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowCreatedEventData {
+    pub escrow_id: u64,
     pub mentor: Address,
     pub learner: Address,
     pub amount: i128,
@@ -88,6 +91,7 @@ pub struct EscrowCreatedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowReleasedEventData {
+    pub escrow_id: u64,
     pub mentor: Address,
     pub amount: i128,
     pub net_amount: i128,
@@ -98,12 +102,14 @@ pub struct EscrowReleasedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowAutoReleasedEventData {
+    pub escrow_id: u64,
     pub time: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeOpenedEventData {
+    pub escrow_id: u64,
     pub caller: Address,
     pub reason: Symbol,
     pub token_address: Address,
@@ -112,6 +118,7 @@ pub struct DisputeOpenedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeResolvedEventData {
+    pub escrow_id: u64,
     pub mentor_pct: u32,
     pub mentor_amount: i128,
     pub learner_amount: i128,
@@ -122,6 +129,7 @@ pub struct DisputeResolvedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowRefundedEventData {
+    pub escrow_id: u64,
     pub learner: Address,
     pub amount: i128,
     pub token_address: Address,
@@ -133,6 +141,16 @@ pub struct ReviewSubmittedEventData {
     pub caller: Address,
     pub reason: Symbol,
     pub mentor: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributedEventData {
+    pub escrow_id: u64,
+    pub gross_amount: i128,
+    pub platform_fee: i128,
+    pub net_amount: i128,
+    pub token_address: Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +487,7 @@ impl EscrowContract {
     ) -> u64 {
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Created"), count),
             EscrowCreatedEventData {
+                escrow_id: count,
                 mentor,
                 learner,
                 amount,
@@ -704,7 +723,7 @@ impl EscrowContract {
         // so listeners can distinguish this path from a manual release.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "AutoReleased"), escrow_id),
-            EscrowAutoReleasedEventData { time: now },
+            EscrowAutoReleasedEventData { escrow_id, time: now },
         );
 
         Self::_do_release(&env, &mut escrow, &key);
@@ -759,6 +778,7 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeOpened"), escrow_id),
             DisputeOpenedEventData {
+                escrow_id,
                 caller,
                 reason,
                 token_address: escrow.token_address,
@@ -861,6 +881,7 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeResolved"), escrow_id),
             DisputeResolvedEventData {
+                escrow_id,
                 mentor_pct,
                 mentor_amount,
                 learner_amount,
@@ -929,6 +950,7 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Refunded"), escrow_id),
             EscrowRefundedEventData {
+                escrow_id,
                 learner: escrow.learner.clone(),
                 amount: escrow.amount,
                 token_address: escrow.token_address,
@@ -1189,10 +1211,22 @@ impl EscrowContract {
         env.events().publish(
             (Symbol::new(env, "Escrow"), Symbol::new(env, "Released"), escrow.id),
             EscrowReleasedEventData {
+                escrow_id: escrow.id,
                 mentor: escrow.mentor.clone(),
                 amount: escrow.amount,
                 net_amount,
                 platform_fee,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "Escrow"), Symbol::new(env, "FeeDistributed"), escrow.id),
+            FeeDistributedEventData {
+                escrow_id: escrow.id,
+                gross_amount: release_amount,
+                platform_fee,
+                net_amount,
                 token_address: escrow.token_address.clone(),
             },
         );
