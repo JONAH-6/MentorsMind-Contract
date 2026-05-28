@@ -860,4 +860,53 @@ mod test {
         f.client().claim_bounty(&f.learner, &id);
         f.client().claim_bounty(&f.learner, &id);
     }
+
+    #[test]
+    fn test_ttl_renewal_preserves_claim_and_bounty_state() {
+        let f = TestFixture::setup();
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Jump the ledger sequence substantially; entries should still be
+        // available because write operations bump persistent TTL.
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.env.ledger().timestamp() + 60,
+            protocol_version: 21,
+            sequence_number: 500_100,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Claimed);
+        let claim = f.client().get_claim(&id, &f.learner);
+        assert_eq!(claim.status, ClaimStatus::Pending);
+    }
+
+    #[test]
+    fn test_ttl_persistence_for_admin_and_count_keys() {
+        let f = TestFixture::setup();
+
+        // Move to a later sequence while staying within configured max TTL.
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.env.ledger().timestamp() + 120,
+            protocol_version: 21,
+            sequence_number: 700_200,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        // If admin and counter keys were not renewed in initialize, posting
+        // would fail due missing configuration. Successful post implies key
+        // persistence across the ledger jump.
+        let id = f.post_default_bounty();
+        assert_eq!(id, 1);
+        assert_eq!(f.client().get_bounty_count(), 1);
+    }
 }
