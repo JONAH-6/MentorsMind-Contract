@@ -47,6 +47,60 @@ env.events().publish(
 
 ---
 
+## Indexing Strategy
+
+### Primary Index Fields
+
+Every escrow event includes `escrow_id` as the primary indexed field. This allows off-chain indexers and backend services to:
+
+- Reconstruct the full lifecycle of any escrow by querying `escrow_id`
+- Filter events by participant (`mentor`, `learner`) where present
+- Sort events chronologically using the ledger `timestamp`
+
+### Recommended Indexes
+
+| Index | Fields | Use Case |
+|---|---|---|
+| Primary | `escrow_id` | Fetch all events for a single escrow |
+| Mentor | `mentor` + `timestamp` | Mentor dashboard, payment history |
+| Learner | `learner` + `timestamp` | Learner dashboard, session history |
+| Topic | `topic` + `timestamp` | Event-type analytics, monitoring |
+| Token | `token_address` + `timestamp` | Per-asset volume reporting |
+
+### Indexer Integration
+
+Backend services should subscribe to contract events via the Horizon event stream and persist them with the following schema:
+
+```sql
+CREATE TABLE contract_events (
+    id            BIGSERIAL PRIMARY KEY,
+    contract_id   TEXT NOT NULL,
+    topic         TEXT NOT NULL,
+    escrow_id     BIGINT,          -- indexed, present on all escrow events
+    ledger_seq    BIGINT NOT NULL,
+    timestamp     BIGINT NOT NULL,
+    payload       JSONB NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_events_escrow_id  ON contract_events (escrow_id);
+CREATE INDEX idx_events_topic      ON contract_events (topic, timestamp);
+CREATE INDEX idx_events_timestamp  ON contract_events (timestamp);
+```
+
+### Cursor-Based Polling
+
+Use Horizon's `cursor` parameter to resume event streaming after restarts:
+
+```typescript
+server.events()
+  .forContract(escrowContractId)
+  .cursor(lastProcessedCursor)
+  .stream({ onmessage: handleEvent });
+```
+
+---
+
 ## Escrow Events
 
 ### EscrowCreated
@@ -61,6 +115,7 @@ env.events().publish(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowCreatedEventData {
+    pub escrow_id: u64,
     pub mentor: Address,
     pub learner: Address,
     pub amount: i128,
@@ -72,6 +127,7 @@ pub struct EscrowCreatedEventData {
 
 **Fields**:
 
+- `escrow_id`: Unique escrow identifier (primary index key)
 - `mentor`: Address of the mentor
 - `learner`: Address of the learner
 - `amount`: Escrow amount in stroops
@@ -85,6 +141,7 @@ pub struct EscrowCreatedEventData {
 {
   "topic": "EscrowCreated",
   "data": {
+    "escrow_id": 42,
     "mentor": "GAAAA...",
     "learner": "GBBBB...",
     "amount": 1000000000,
@@ -117,6 +174,7 @@ pub struct EscrowCreatedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowReleasedEventData {
+    pub escrow_id: u64,
     pub mentor: Address,
     pub amount: i128,
     pub net_amount: i128,
@@ -127,6 +185,7 @@ pub struct EscrowReleasedEventData {
 
 **Fields**:
 
+- `escrow_id`: Unique escrow identifier (primary index key)
 - `mentor`: Address receiving funds
 - `amount`: Gross amount released
 - `net_amount`: Amount after fees
@@ -139,6 +198,7 @@ pub struct EscrowReleasedEventData {
 {
   "topic": "EscrowReleased",
   "data": {
+    "escrow_id": 42,
     "mentor": "GAAAA...",
     "amount": 1000000000,
     "net_amount": 950000000,
@@ -170,12 +230,14 @@ pub struct EscrowReleasedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowAutoReleasedEventData {
+    pub escrow_id: u64,
     pub time: u64,
 }
 ```
 
 **Fields**:
 
+- `escrow_id`: Unique escrow identifier (primary index key)
 - `time`: Unix timestamp of auto-release
 
 **Example**:
@@ -211,6 +273,7 @@ pub struct EscrowAutoReleasedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeOpenedEventData {
+    pub escrow_id: u64,
     pub caller: Address,
     pub reason: Symbol,
     pub token_address: Address,
@@ -219,6 +282,7 @@ pub struct DisputeOpenedEventData {
 
 **Fields**:
 
+- `escrow_id`: Unique escrow identifier (primary index key)
 - `caller`: Address that opened dispute
 - `reason`: Dispute reason (max 500 chars)
 - `token_address`: Token contract address
@@ -258,6 +322,7 @@ pub struct DisputeOpenedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeResolvedEventData {
+    pub escrow_id: u64,
     pub mentor_pct: u32,
     pub mentor_amount: i128,
     pub learner_amount: i128,
@@ -268,6 +333,7 @@ pub struct DisputeResolvedEventData {
 
 **Fields**:
 
+- `escrow_id`: Unique escrow identifier (primary index key)
 - `mentor_pct`: Percentage of funds to mentor (0-100)
 - `mentor_amount`: Amount paid to mentor
 - `learner_amount`: Amount refunded to learner
@@ -311,6 +377,7 @@ pub struct DisputeResolvedEventData {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowRefundedEventData {
+    pub escrow_id: u64,
     pub learner: Address,
     pub amount: i128,
     pub reason: Symbol,
@@ -320,6 +387,7 @@ pub struct EscrowRefundedEventData {
 
 **Fields**:
 
+- `escrow_id`: Unique escrow identifier (primary index key)
 - `learner`: Address receiving refund
 - `amount`: Refund amount
 - `reason`: Refund reason
