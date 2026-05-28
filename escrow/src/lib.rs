@@ -157,6 +157,9 @@ const MAX_FEE_BPS: u32 = 1_000;
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
 
 // Approved token registry key prefix: ("APRV_TOK", address) → bool
+
+// Cache key for admin address
+const CACHE_ADMIN_KEY: Symbol = symbol_short!("CACHE_ADMIN");
 const APPROVED_TOKEN_KEY: Symbol = symbol_short!("APRV_TOK");
 
 // ---------------------------------------------------------------------------
@@ -165,6 +168,14 @@ const APPROVED_TOKEN_KEY: Symbol = symbol_short!("APRV_TOK");
 
 const ESCROW_TTL_THRESHOLD: u32 = 500_000;
 const ESCROW_TTL_BUMP: u32 = 1_000_000;
+
+// Cache TTL constants for frequently accessed data
+const CACHE_TTL_THRESHOLD: u32 = 100_000;
+const CACHE_TTL_BUMP: u32 = 500_000;
+
+// Cache statistics keys
+const CACHE_HITS_KEY: Symbol = symbol_short!("CACHE_HITS");
+const_CACHE_MISSES_KEY: Symbol = symbol_short!("CACHE_MISSES");
 
 // ---------------------------------------------------------------------------
 // Contract
