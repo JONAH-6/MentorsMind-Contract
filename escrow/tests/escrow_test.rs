@@ -420,3 +420,281 @@ fn test_page_size_cap() {
     let results = f.client().get_escrows_by_mentor(&mentor, &0, &100);
     assert_eq!(results.len(), 50);
 }
+
+// -----------------------------------------------------------------------
+// Task 1: Partial refund tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_partial_refund_50_percent() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PR1");
+
+    let learner_before = f.token().balance(&f.learner);
+    f.client().partial_refund(&id, &5_000u32); // 50%
+
+    assert_eq!(f.token().balance(&f.learner), learner_before + 500);
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.amount, 500);
+    assert_eq!(e.status, EscrowStatus::Active); // still active
+}
+
+#[test]
+fn test_partial_refund_100_percent_closes_escrow() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PR2");
+
+    let learner_before = f.token().balance(&f.learner);
+    f.client().partial_refund(&id, &10_000u32); // 100%
+
+    assert_eq!(f.token().balance(&f.learner), learner_before + 1_000);
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.amount, 0);
+    assert_eq!(e.status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn test_partial_refund_on_disputed_escrow() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PR3");
+    f.open_dispute(id);
+
+    let learner_before = f.token().balance(&f.learner);
+    f.client().partial_refund(&id, &2_500u32); // 25%
+
+    assert_eq!(f.token().balance(&f.learner), learner_before + 250);
+    assert_eq!(f.client().get_escrow(&id).amount, 750);
+}
+
+#[test]
+#[should_panic(expected = "refund_bps must be between 1 and 10000")]
+fn test_partial_refund_zero_bps_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PR4");
+    f.client().partial_refund(&id, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "refund_bps must be between 1 and 10000")]
+fn test_partial_refund_over_10000_bps_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PR5");
+    f.client().partial_refund(&id, &10_001u32);
+}
+
+#[test]
+#[should_panic(expected = "Escrow must be Active or Disputed for partial refund")]
+fn test_partial_refund_on_released_escrow_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PR6");
+    f.client().release_funds(&f.learner, &id);
+    f.client().partial_refund(&id, &5_000u32);
+}
+
+// -----------------------------------------------------------------------
+// Task 2: Escrow transfer tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_transfer_escrow_new_mentor() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "TR1");
+    let new_mentor = Address::generate(&f.env);
+
+    f.client().transfer_escrow(&id, &Some(new_mentor.clone()), &None);
+
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.mentor, new_mentor);
+    assert_eq!(e.learner, f.learner);
+}
+
+#[test]
+fn test_transfer_escrow_new_learner() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "TR2");
+    let new_learner = Address::generate(&f.env);
+
+    f.client().transfer_escrow(&id, &None, &Some(new_learner.clone()));
+
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.mentor, f.mentor);
+    assert_eq!(e.learner, new_learner);
+}
+
+#[test]
+fn test_transfer_escrow_both_parties() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "TR3");
+    let new_mentor = Address::generate(&f.env);
+    let new_learner = Address::generate(&f.env);
+
+    f.client().transfer_escrow(&id, &Some(new_mentor.clone()), &Some(new_learner.clone()));
+
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.mentor, new_mentor);
+    assert_eq!(e.learner, new_learner);
+}
+
+#[test]
+#[should_panic(expected = "Escrow must be Active to transfer")]
+fn test_transfer_escrow_released_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "TR4");
+    f.client().release_funds(&f.learner, &id);
+    let new_mentor = Address::generate(&f.env);
+    f.client().transfer_escrow(&id, &Some(new_mentor), &None);
+}
+
+// -----------------------------------------------------------------------
+// Task 3: Auto-expiration tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_expire_escrow_after_one_year() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "EX1");
+
+    let learner_before = f.token().balance(&f.learner);
+
+    // Advance past 1 year
+    advance_time(&f.env, 365 * 24 * 60 * 60 + 1);
+    f.client().expire_escrow(&id);
+
+    assert_eq!(f.token().balance(&f.learner), learner_before + 1_000);
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.status, EscrowStatus::Refunded);
+    assert_eq!(e.amount, 0);
+}
+
+#[test]
+#[should_panic(expected = "Escrow has not expired yet")]
+fn test_expire_escrow_before_one_year_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "EX2");
+
+    // Only advance 364 days
+    advance_time(&f.env, 364 * 24 * 60 * 60);
+    f.client().expire_escrow(&id);
+}
+
+#[test]
+#[should_panic(expected = "Escrow not active")]
+fn test_expire_already_released_escrow_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "EX3");
+    f.client().release_funds(&f.learner, &id);
+
+    advance_time(&f.env, 365 * 24 * 60 * 60 + 1);
+    f.client().expire_escrow(&id);
+}
+
+#[test]
+fn test_expire_escrow_permissionless() {
+    // Anyone can trigger expiration — no auth required
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "EX4");
+    advance_time(&f.env, 365 * 24 * 60 * 60 + 1);
+
+    // Call from a random address (mock_all_auths covers it, but expire_escrow
+    // doesn't require_auth so this is truly permissionless)
+    f.client().expire_escrow(&id);
+    assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Refunded);
+}
+
+// -----------------------------------------------------------------------
+// Task 4: Pause / Resume tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_pause_and_resume_extends_deadline() {
+    let f = TestFixture::setup_full(0, 3600);
+    let now = f.env.ledger().timestamp();
+    let id = f.create_escrow_at(1_000, now + 7200, "PS1");
+
+    let original_end = f.client().get_escrow(&id).session_end_time;
+
+    // Pause
+    f.client().pause_escrow(&f.learner, &id);
+    assert!(f.client().is_paused(&id));
+
+    // Advance 1 hour while paused
+    advance_time(&f.env, 3600);
+
+    // Resume
+    f.client().resume_escrow(&f.mentor, &id);
+    assert!(!f.client().is_paused(&id));
+
+    // session_end_time should be extended by 3600 seconds
+    let e = f.client().get_escrow(&id);
+    assert_eq!(e.session_end_time, original_end + 3600);
+}
+
+#[test]
+fn test_pause_by_mentor() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PS2");
+    f.client().pause_escrow(&f.mentor, &id);
+    assert!(f.client().is_paused(&id));
+}
+
+#[test]
+fn test_pause_by_learner() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PS3");
+    f.client().pause_escrow(&f.learner, &id);
+    assert!(f.client().is_paused(&id));
+}
+
+#[test]
+#[should_panic(expected = "Escrow already paused")]
+fn test_double_pause_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PS4");
+    f.client().pause_escrow(&f.learner, &id);
+    f.client().pause_escrow(&f.learner, &id);
+}
+
+#[test]
+#[should_panic(expected = "Escrow is not paused")]
+fn test_resume_not_paused_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PS5");
+    f.client().resume_escrow(&f.learner, &id);
+}
+
+#[test]
+#[should_panic(expected = "Escrow must be Active to pause")]
+fn test_pause_released_escrow_panics() {
+    let f = TestFixture::setup_with_fee(0);
+    let id = f.create_escrow_at(1_000, 0, "PS6");
+    f.client().release_funds(&f.learner, &id);
+    f.client().pause_escrow(&f.learner, &id);
+}
+
+#[test]
+fn test_auto_release_blocked_while_paused() {
+    // After pause+resume, the deadline is extended so auto-release should
+    // not trigger at the original time.
+    let f = TestFixture::setup_full(0, 3600);
+    let now = f.env.ledger().timestamp();
+    let id = f.create_escrow_at(1_000, now, "PS7");
+
+    // Pause immediately, advance 1 hour, resume
+    f.client().pause_escrow(&f.learner, &id);
+    advance_time(&f.env, 3600);
+    f.client().resume_escrow(&f.mentor, &id);
+
+    // At this point session_end_time was extended by 3600s.
+    // The auto-release window is session_end_time + auto_release_delay.
+    // We are now at now+3600; session_end_time = now+3600; window = now+3600+3600 = now+7200.
+    // Trying to auto-release now should fail.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.client().try_auto_release(&id);
+    }));
+    assert!(result.is_err(), "Auto-release should be blocked after pause extension");
+
+    // Advance past the extended window
+    advance_time(&f.env, 3600 + 1);
+    f.client().try_auto_release(&id);
+    assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Released);
+}

@@ -1,22 +1,80 @@
-# Architecture Notes
+# MentorMinds Contract Architecture
 
-## Audit Log Hash Algorithm
+This document describes system architecture, contract relationships, data flow, and deployment topology for MentorMinds on Stellar Soroban.
 
-Each audit log record carries a `record_hash` that commits to its content, and a `previous_hash` that chains it to the prior record.
+## Architecture Diagrams
 
-### `record_hash` computation
+- System context / C4 L1: `docs/diagrams/system_architecture.png`
+- Contract relationship map / UML component-style: `docs/diagrams/contract_relationships.png`
+- Escrow-centric data flow: `docs/diagrams/data_flow.png`
+- Deployment topology (testnet/mainnet): `docs/diagrams/deployment_architecture.png`
 
-```
-SHA-256( id | action | user_id | createdAt.toISOString() | previous_hash )
-```
+## System Context (C4 L1)
 
-Fields are joined with the `|` separator. `previous_hash` is the empty string for the first record.
+Primary actors and systems:
+- Learner and Mentor clients (wallet-backed)
+- MentorMinds backend services (indexing, orchestration)
+- Soroban smart contracts (escrow core + supporting modules)
+- Stellar network (testnet/mainnet)
 
-The implementation lives in `mentorminds-backend/src/services/audit-log.service.ts` (`computeRecordHash`).
+Trust boundaries:
+- User wallet boundary (signature authority)
+- Off-chain backend boundary (read/index/automation)
+- On-chain execution boundary (state + funds)
 
-### Chain verification
+## Contract Relationship View
 
-`AuditLogService.verifyChainIntegrity` checks two things per record:
+Core contracts:
+- `escrow`: lifecycle state + fund custody logic
+- `verification`: mentor verification state
+- `mnt_token`: token/utility integration
 
-1. **Content integrity** — recomputes `record_hash` from the record's fields and compares with the stored value. A mismatch means the record was tampered with after creation.
-2. **Chain link** — verifies `current.previous_hash === previous.record_hash`. A mismatch means a record was inserted, deleted, or reordered.
+Supporting contracts (examples):
+- `reputation`: consumes escrow completion status for reviews
+- `dispute_evidence`: accepts evidence only while escrow is disputed
+- `health_dashboard`: aggregates metrics across contracts
+- `escrow_factory`: deployment/orchestration for escrow instances
+
+Design rule:
+- Cross-contract consumers mirror escrow struct/status fields for decode stability.
+
+## Data Flow View
+
+Escrow lifecycle flow:
+1. Learner creates escrow (`Active`) and funds are locked.
+2. Session completes; escrow is released manually or via timeout.
+3. If contested, escrow enters `Disputed` and evidence/arbitration flows run.
+4. Final outcome transitions to a terminal state (`Released`, `Refunded`, `Resolved`).
+5. Downstream contracts (reputation, analytics, dashboards) consume finalized outcomes.
+
+Operational flow:
+1. Contracts are deployed via `scripts/deploy.sh`.
+2. Addresses and metadata are persisted in `deployed/<network>.json`.
+3. Backend/services read deployment metadata to configure environment-specific contract bindings.
+
+## Deployment Architecture
+
+Environments:
+- Testnet for development/integration
+- Mainnet for production
+
+Per-environment deployment includes:
+- Distinct contract IDs
+- Distinct admin identity and treasury settings
+- Distinct deployment metadata file (`deployed/testnet.json`, `deployed/mainnet.json`)
+
+Deployment controls:
+- Parameterized initialization (`fee_bps`, `auto_release_delay_secs`, approved tokens)
+- Optional skip flags for build/fund/init/verify
+- Optional forced redeploy for fresh IDs
+
+## Diagram Maintenance
+
+Keep diagrams aligned with code and docs when:
+- new contracts are introduced
+- escrow status model changes
+- deployment workflow changes
+
+Update paths:
+- diagram files under `docs/diagrams/`
+- related docs: `docs/STATE_MACHINE.md`, `docs/DEPLOYMENT_GUIDE.md`, `README.md`

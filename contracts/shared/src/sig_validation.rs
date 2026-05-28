@@ -68,7 +68,7 @@ const NONCE_PREFIX: Symbol = symbol_short!("NONCE");
 /// meta-transaction actions are added; the discriminant is included in the
 /// signed payload so a signature for one action cannot be replayed as another.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MetaTxAction {
     /// Authorise deploying a new escrow on behalf of a learner.
     DeployEscrow = 0,

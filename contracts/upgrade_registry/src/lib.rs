@@ -98,6 +98,8 @@ impl UpgradeRegistryContract {
             .get(&DataKey::UpgradeHistory(contract_name.clone()))
             .unwrap_or(Vec::new(&env));
 
+        // Append before persisting so the upgrade trail remains ordered and
+        // replayable by downstream indexers.
         history.push_back(record);
 
         // Store updated history
@@ -140,6 +142,8 @@ impl UpgradeRegistryContract {
             }
         }
 
+        // Keep the subscriber list unique so the same address does not receive
+        // duplicate upgrade notifications.
         subscribers.push_back(subscriber.clone());
 
         env.storage()
@@ -179,6 +183,8 @@ impl UpgradeRegistryContract {
             return Err(Error::NotSubscribed);
         }
 
+        // Rebuild the list instead of mutating in place; the intent is clearer
+        // and the resulting state stays deterministic.
         env.storage().persistent().set(
             &DataKey::Subscribers(contract_name.clone()),
             &new_subscribers,
