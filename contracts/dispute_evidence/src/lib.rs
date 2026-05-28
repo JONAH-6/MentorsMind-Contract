@@ -52,10 +52,20 @@ pub struct EvidenceItem {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolution {
+    pub arbitrator: Address,
+    pub release_to_mentor: bool,
+    pub note: Symbol,
+    pub resolved_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     EscrowContract,
     Evidence(u64),
+    Resolution(u64),
     WindowSecs,
 }
 
@@ -73,6 +83,7 @@ pub enum Error {
     InvalidEscrowState = 3,
     EvidenceWindowClosed = 4,
     EvidenceLimitReached = 5,
+    AlreadyResolved = 6,
 }
 
 #[contract]
@@ -164,6 +175,45 @@ impl DisputeEvidenceContract {
         Self::get_evidence(env, escrow_id).len()
     }
 
+    pub fn submit_resolution(
+        env: Env,
+        escrow_id: u64,
+        arbitrator: Address,
+        release_to_mentor: bool,
+        note: Symbol,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+        let escrow = Self::load_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+
+        let key = DataKey::Resolution(escrow_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyResolved);
+        }
+
+        let resolution = DisputeResolution {
+            arbitrator: arbitrator.clone(),
+            release_to_mentor,
+            note,
+            resolved_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &resolution);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_resolved"), escrow_id),
+            resolution,
+        );
+        Ok(())
+    }
+
+    pub fn get_resolution(env: Env, escrow_id: u64) -> DisputeResolution {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Resolution(escrow_id))
+            .expect("resolution not found")
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
@@ -190,7 +240,7 @@ impl DisputeEvidenceContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contractimpl, testutils::Address as _};
+    use soroban_sdk::{contractimpl, testutils::{Address as _, Events}, IntoVal, TryFromVal};
 
     #[contract]
     struct MockEscrow;
@@ -241,5 +291,59 @@ mod tests {
         }
 
         assert_eq!(client.get_evidence_count(&1), MAX_EVIDENCE_ITEMS);
+    }
+
+    #[test]
+    fn stores_dispute_resolution_once() {
+    fn emits_ordered_dispute_events_with_expected_payloads() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let escrow_contract = env.register_contract(None, MockEscrow);
+        let contract_id = env.register_contract(None, DisputeEvidenceContract);
+        let client = DisputeEvidenceContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        client.initialize(&admin, &escrow_contract);
+        client.submit_resolution(
+            &1,
+            &arbitrator,
+            &true,
+            &Symbol::new(&env, "mentor_wins"),
+        );
+
+        let stored = client.get_resolution(&1);
+        assert_eq!(stored.arbitrator, arbitrator);
+        assert!(stored.release_to_mentor);
+
+        client.initialize(&admin, &escrow_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&7);
+
+        client.submit_evidence(&7, &escrow.mentor, &Symbol::new(&env, "proof_a"));
+        client.submit_evidence(&7, &escrow.learner, &Symbol::new(&env, "proof_b"));
+
+        let events = env.events().all();
+        assert!(events.len() >= 2);
+
+        let evidence_event = events.get(events.len() - 2).unwrap();
+        assert_eq!(
+            evidence_event.1,
+            (Symbol::new(&env, "evidence_submitted"), 7u64).into_val(&env)
+        );
+        let evidence_payload = EvidenceItem::try_from_val(&env, &evidence_event.2)
+            .expect("evidence payload should decode");
+        assert_eq!(evidence_payload.submitter, escrow.mentor);
+        assert_eq!(evidence_payload.evidence_ref, Symbol::new(&env, "proof_a"));
+
+        let resolution_event = events.last().unwrap();
+        assert_eq!(
+            resolution_event.1,
+            (Symbol::new(&env, "evidence_submitted"), 7u64).into_val(&env)
+        );
+        let resolution_payload = EvidenceItem::try_from_val(&env, &resolution_event.2)
+            .expect("evidence payload should decode");
+        assert_eq!(resolution_payload.submitter, escrow.learner);
+        assert_eq!(resolution_payload.evidence_ref, Symbol::new(&env, "proof_b"));
     }
 }
