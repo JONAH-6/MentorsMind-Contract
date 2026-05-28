@@ -10,6 +10,14 @@ This repository contains the Soroban smart contracts that power the MentorMinds 
 - **Multi-Sig Wallet**: Multi-signature wallet for platform administration
 - **Payment Router**: Automated payment distribution and fee collection
 
+## 📘 Documentation Hub
+
+- Deployment: `docs/DEPLOYMENT_GUIDE.md`
+- State transitions: `docs/STATE_MACHINE.md`
+- Architecture: `ARCHITECTURE.md`
+- Troubleshooting: `docs/TROUBLESHOOTING.md`
+- FAQ: `docs/FAQ.md`
+
 ## 📋 Prerequisites
 
 - **Rust** 1.70+ with wasm32 target
@@ -147,6 +155,23 @@ soroban contract optimize --wasm target/wasm32-unknown-unknown/release/escrow.wa
 ```
 
 ## 🚀 Deployment
+
+Recommended deployment path (all environments):
+
+```bash
+./scripts/deploy.sh --network testnet --identity default
+./scripts/deploy.sh --network mainnet --identity production --validation-cloud-key "$VALIDATION_CLOUD_KEY"
+```
+
+Deployment details, initialization workflow, config flags, and checklists are documented in `docs/DEPLOYMENT_GUIDE.md`.
+
+Architecture and diagram references:
+- `ARCHITECTURE.md`
+- `docs/diagrams/`
+
+Escrow lifecycle and state machine details:
+- `docs/STATE_MACHINE.md`
+- `contracts/escrow/INVARIANTS.md`
 
 ### Deploy to Testnet
 ```bash
@@ -328,7 +353,9 @@ MIT License - see LICENSE file for details
 ## 🆘 Support
 
 For issues and questions:
-- Create an issue on GitHub
+- Check troubleshooting first: `docs/TROUBLESHOOTING.md`
+- Check common questions: `docs/FAQ.md`
+- Create an issue on GitHub with command, network, logs, and commit SHA
 - Join Stellar Discord
 - Check Soroban documentation
 

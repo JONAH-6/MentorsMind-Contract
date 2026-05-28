@@ -9,6 +9,7 @@ use soroban_sdk::contracterror;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
+pub mod ttl_utils;
 
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
@@ -16,6 +17,7 @@ pub use sig_validation::{
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
 };
 pub use state_machine::StateMachine;
+pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]

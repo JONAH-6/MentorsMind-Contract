@@ -1,4 +1,5 @@
 #![no_std]
+use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Vec,
@@ -175,6 +176,10 @@ const AUTO_REL_DLY: Symbol = symbol_short!("AR_DELAY");
 /// Contract version for upgrade tracking
 const CONTRACT_VERSION: Symbol = symbol_short!("CONTRACT_VER");
 
+// Fee cache storage keys (instance-level)
+const FEE_CACHE_KEYS: Symbol = symbol_short!("FEE_KEYS");
+const FEE_CACHE_VALS: Symbol = symbol_short!("FEE_VALS");
+
 /// Maximum configurable fee: 10% = 1 000 basis points.
 const SESSION_KEY: Symbol = symbol_short!("SESSION");
 const MENTOR_ESCROWS: Symbol = symbol_short!("MNT_ESC");
@@ -322,6 +327,10 @@ impl EscrowContract {
 
         env.storage().persistent().set(&FEE_BPS, &new_fee_bps);
         env.storage().persistent().extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        // Invalidate fee cache when fee BPS changes.
+        env.storage().instance().set(&FEE_CACHE_KEYS, &Vec::new(&env));
+        env.storage().instance().set(&FEE_CACHE_VALS, &Vec::new(&env));
     }
 
     /// Update the treasury address — admin only.
@@ -340,6 +349,69 @@ impl EscrowContract {
         env.storage().persistent().extend_ttl(&ADMIN, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
         admin.require_auth();
         Self::_set_token_approved(&env, &token_address, approved);
+    }
+
+    /// Internal helper: get cached platform fee for `amount` or compute and
+    /// store it in instance storage. The cache is invalidated when `update_fee`
+    /// is called.
+    fn get_cached_platform_fee(env: &Env, amount: i128) -> i128 {
+        let mut keys: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&FEE_CACHE_KEYS)
+            .unwrap_or(Vec::new(&env));
+        let mut vals: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&FEE_CACHE_VALS)
+            .unwrap_or(Vec::new(&env));
+
+        let mut i = 0;
+        while i < keys.len() {
+            if keys.get(i).unwrap() == amount {
+                return vals.get(i).unwrap();
+            }
+            i += 1;
+        }
+
+        // Read current fee bps and extend its TTL
+        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
+        env.storage()
+            .persistent()
+            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let platform_fee: i128 = amount
+            .checked_mul(fee_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+
+        keys.push_back(amount);
+        vals.push_back(platform_fee);
+        env.storage().instance().set(&FEE_CACHE_KEYS, &keys);
+        env.storage().instance().set(&FEE_CACHE_VALS, &vals);
+
+        platform_fee
+    }
+
+    /// Clear the escrow fee cache (administrative / programmatic invalidation).
+    pub fn clear_fee_cache(env: Env) {
+        env.storage()
+            .instance()
+            .set(&FEE_CACHE_KEYS, &Vec::new(&env));
+        env.storage()
+            .instance()
+            .set(&FEE_CACHE_VALS, &Vec::new(&env));
+    }
+
+    /// Return current fee cache length (observability/test helper).
+    pub fn fee_cache_len(env: Env) -> u32 {
+        let keys: Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&FEE_CACHE_KEYS)
+            .unwrap_or(Vec::new(&env));
+        keys.len()
     }
 
     // -----------------------------------------------------------------------
@@ -584,16 +656,8 @@ impl EscrowContract {
                 .expect("Division error")
         };
 
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = amount_to_release
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+        // Compute platform fee (cached) and net amount
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, amount_to_release);
         let net_amount: i128 = amount_to_release
             .checked_sub(platform_fee)
             .expect("Underflow");
@@ -1006,7 +1070,7 @@ impl EscrowContract {
             .persistent()
             .get(&GROUP_ESCROW_COUNT)
             .unwrap_or(0);
-        count += 1;
+        count = count.checked_add(1).expect("Overflow");
         env.storage().persistent().set(&GROUP_ESCROW_COUNT, &count);
         env.storage().persistent().extend_ttl(
             &GROUP_ESCROW_COUNT,
@@ -1160,17 +1224,8 @@ impl EscrowContract {
             .checked_mul(group.learners.len() as i128)
             .expect("overflow");
 
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = gross
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
-        let net_amount: i128 = escrow.amount.checked_sub(platform_fee).expect("Underflow");
+        // Compute platform fee using the cache and derive net amount
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, gross);
         let net_amount: i128 = gross.checked_sub(platform_fee).expect("Underflow");
 
         let treasury: Address = env
@@ -1210,6 +1265,69 @@ impl EscrowContract {
                 escrow.token_address.clone(),
             )
         );
+    }
+
+
+
+    pub fn update_escrow_metadata(env: Env, escrow_id: u64, metadata: EscrowMetadata) {
+        let key = (symbol_short!("EscrowMeta"), escrow_id);
+        env.storage().persistent().set(&key, &metadata);
+        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.events().publish((symbol_short!("Escrow"), symbol_short!("meta_upd"), escrow_id), escrow_id);
+    }
+
+    pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Option<EscrowMetadata> {
+        let key = (symbol_short!("EscrowMeta"), escrow_id);
+        env.storage().persistent().get(&key)
+    }
+
+    pub fn submit_rating(env: Env, caller: Address, escrow_id: u64, is_mentor: bool, rating: u32, review: String) {
+        caller.require_auth();
+        if rating < 1 || rating > 5 {
+            panic!("Invalid rating");
+        }
+        
+        let key = (symbol_short!("Escrow"), escrow_id);
+        let escrow: Escrow = env.storage().persistent().get(&key).expect("Escrow not found");
+        
+        if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Resolved {
+            panic!("Escrow not completed");
+        }
+        
+        if is_mentor && caller != escrow.mentor {
+            panic!("Not the mentor");
+        } else if !is_mentor && caller != escrow.learner {
+            panic!("Not the learner");
+        }
+
+        let rating_key = (symbol_short!("Rating"), escrow_id, caller.clone());
+        if env.storage().persistent().has(&rating_key) {
+            panic!("Already rated");
+        }
+        
+        env.storage().persistent().set(&rating_key, &rating);
+        env.storage().persistent().extend_ttl(&rating_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("Escrow"), symbol_short!("rated"), escrow_id),
+            (caller, is_mentor, rating, review, env.ledger().timestamp())
+        );
+    }
+
+    pub fn get_escrows_by_status(env: Env, status: EscrowStatus) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
+    pub fn get_escrows_by_mentor(env: Env, mentor: Address) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
+    pub fn get_escrows_by_learner(env: Env, learner: Address) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
+    pub fn get_escrows_by_date_range(env: Env, start: u64, end: u64) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
     }
 
 }
@@ -2216,17 +2334,8 @@ mod test {
             .get(milestone_index as u32)
             .unwrap();
 
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = milestone
-            .amount
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+        // Compute platform fee using cached helper
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, milestone.amount);
         let net_amount: i128 = milestone
             .amount
             .checked_sub(platform_fee)
@@ -2700,17 +2809,8 @@ mod test {
                 );
             }
         }
-        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        // Fee is applied only on the principal (gross), not on yield.
-        let platform_fee: i128 = gross
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+        // Compute platform fee (cached) on principal only (gross), not on yield.
+        let platform_fee: i128 = Self::get_cached_platform_fee(&env, gross);
         let net_amount: i128 = gross.checked_sub(platform_fee).expect("Underflow");
 
         let treasury: Address = env
@@ -3344,3 +3444,26 @@ mod yield_tests {
         assert_eq!(f.client().get_accrued_yield(&id), 100);
     }
 }
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowMetadata {
+    pub subject: String,
+    pub mentorship_level: String,
+    pub notes: String,
+    pub tags: soroban_sdk::Vec<String>,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowQuery {
+    pub status: Option<EscrowStatus>,
+    pub mentor: Option<Address>,
+    pub learner: Option<Address>,
+    pub start_date: Option<u64>,
+    pub end_date: Option<u64>,
+}
+

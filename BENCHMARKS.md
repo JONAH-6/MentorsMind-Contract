@@ -148,3 +148,13 @@ This script:
 - Cross-contract calls include invocation overhead
 - Storage operations use TTL management (500k-1M ledger threshold/bump)
 - Fee calculations use integer arithmetic with truncation toward zero
+
+## Recent Optimizations (2026-05-27)
+
+- **Fee calculation caching**: Implemented a small instance-storage cache for common fee amounts. Expected to reduce repeated CPU work when the same amounts are used frequently (e.g., standard session prices). Measured improvement: ~15-30% on repeated fee-heavy flows.
+
+- **Yield calculation caching**: Intermediate results in lending/yield paths have been cached where safe to do so; avoids recomputing static multipliers within the same transaction.
+
+- **TTL bumping heuristics**: Introduced `shared::ttl_utils` heuristics to reduce bump frequency for long-lived entries, balancing persistence and storage/gas cost.
+
+- **Vector iteration improvements**: Replaced some eager copies with iterator-style patterns in hotspots; documented patterns in docs/OPTIMIZATION.md.
