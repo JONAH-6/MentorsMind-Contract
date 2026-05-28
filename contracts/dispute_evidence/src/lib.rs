@@ -190,7 +190,7 @@ impl DisputeEvidenceContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contractimpl, testutils::Address as _};
+    use soroban_sdk::{contractimpl, testutils::{Address as _, Events}, IntoVal, TryFromVal};
 
     #[contract]
     struct MockEscrow;
@@ -241,5 +241,45 @@ mod tests {
         }
 
         assert_eq!(client.get_evidence_count(&1), MAX_EVIDENCE_ITEMS);
+    }
+
+    #[test]
+    fn emits_ordered_dispute_events_with_expected_payloads() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let escrow_contract = env.register_contract(None, MockEscrow);
+        let contract_id = env.register_contract(None, DisputeEvidenceContract);
+        let client = DisputeEvidenceContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin, &escrow_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&7);
+
+        client.submit_evidence(&7, &escrow.mentor, &Symbol::new(&env, "proof_a"));
+        client.submit_evidence(&7, &escrow.learner, &Symbol::new(&env, "proof_b"));
+
+        let events = env.events().all();
+        assert!(events.len() >= 2);
+
+        let evidence_event = events.get(events.len() - 2).unwrap();
+        assert_eq!(
+            evidence_event.1,
+            (Symbol::new(&env, "evidence_submitted"), 7u64).into_val(&env)
+        );
+        let evidence_payload = EvidenceItem::try_from_val(&env, &evidence_event.2)
+            .expect("evidence payload should decode");
+        assert_eq!(evidence_payload.submitter, escrow.mentor);
+        assert_eq!(evidence_payload.evidence_ref, Symbol::new(&env, "proof_a"));
+
+        let resolution_event = events.last().unwrap();
+        assert_eq!(
+            resolution_event.1,
+            (Symbol::new(&env, "evidence_submitted"), 7u64).into_val(&env)
+        );
+        let resolution_payload = EvidenceItem::try_from_val(&env, &resolution_event.2)
+            .expect("evidence payload should decode");
+        assert_eq!(resolution_payload.submitter, escrow.learner);
+        assert_eq!(resolution_payload.evidence_ref, Symbol::new(&env, "proof_b"));
     }
 }
