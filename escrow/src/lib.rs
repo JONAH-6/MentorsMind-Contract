@@ -143,6 +143,16 @@ pub struct ReviewSubmittedEventData {
     pub mentor: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributedEventData {
+    pub escrow_id: u64,
+    pub gross_amount: i128,
+    pub platform_fee: i128,
+    pub net_amount: i128,
+    pub token_address: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -1206,6 +1216,17 @@ impl EscrowContract {
                 amount: escrow.amount,
                 net_amount,
                 platform_fee,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "Escrow"), Symbol::new(env, "FeeDistributed"), escrow.id),
+            FeeDistributedEventData {
+                escrow_id: escrow.id,
+                gross_amount: release_amount,
+                platform_fee,
+                net_amount,
                 token_address: escrow.token_address.clone(),
             },
         );

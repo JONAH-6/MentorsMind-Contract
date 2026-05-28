@@ -83,3 +83,59 @@ Keep diagrams aligned with code and docs when:
 Update paths:
 - diagram files under `docs/diagrams/`
 - related docs: `docs/STATE_MACHINE.md`, `docs/DEPLOYMENT_GUIDE.md`, `README.md`
+
+## Fee Distribution Strategy
+
+Every escrow release deducts a platform fee from the gross amount. That fee is then
+split across four destinations according to fixed basis-point allocations.
+
+### Fee Percentages
+
+| Destination | Allocation | Basis Points | Contract |
+|---|---|---|---|
+| Treasury (platform revenue) | 80% of fee | configurable via `fee_bps` | `contracts/treasury` |
+| Referral rewards | 10% of fee | 1000 bps of fee | `contracts/referral` |
+| Insurance pool | 10% of fee | 1000 bps of fee | `contracts/insurance` |
+
+The top-level `fee_bps` is set at initialization (default 500 bps = 5% of escrow amount,
+capped at 1000 bps = 10%). Dynamic fee adjustment based on MNT/USDC price is supported
+via `get_dynamic_fee`.
+
+### Distribution Flow
+
+```
+escrow.amount
+    └─ platform_fee  (amount × fee_bps / 10_000)
+    │       ├─ 80% → treasury.deposit()
+    │       ├─ 10% → referral.distribute_from_fee()   (reward_bps = 1000)
+    │       └─ 10% → insurance.accrue_yield()          (YIELD_BPS = 10 bps of fee)
+    └─ net_amount    (amount − platform_fee) → mentor
+```
+
+A `FeeDistributed` event is emitted on every release with the full breakdown so
+off-chain indexers can track revenue without reading contract storage.
+
+### Contract Responsibilities
+
+- **`escrow`**: calculates `platform_fee` and `net_amount`, transfers both, emits
+  `EscrowReleased` and `FeeDistributed` events.
+- **`treasury`** (`contracts/treasury/src/lib.rs`): receives the platform share via
+  `deposit`; admin can `allocate` or `distribute_to_stakers`.
+- **`referral`** (`contracts/referral/src/lib.rs`): `distribute_from_fee(referrer,
+  platform_fee, reward_bps)` adds `platform_fee × reward_bps / 10_000` to the
+  referrer's pending MNT rewards.
+- **`insurance`** (`contracts/insurance/src/lib.rs`): `accrue_yield(provider,
+  platform_fee)` credits 0.1% of the fee (10 bps) to the provider's pool shares.
+
+### Fee Events
+
+```rust
+// Emitted by escrow._do_release on every release
+pub struct FeeDistributedEventData {
+    pub escrow_id:      u64,
+    pub gross_amount:   i128,
+    pub platform_fee:   i128,
+    pub net_amount:     i128,
+    pub token_address:  Address,
+}
+```
