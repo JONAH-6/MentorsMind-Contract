@@ -158,3 +158,45 @@ This script:
 - **TTL bumping heuristics**: Introduced `shared::ttl_utils` heuristics to reduce bump frequency for long-lived entries, balancing persistence and storage/gas cost.
 
 - **Vector iteration improvements**: Replaced some eager copies with iterator-style patterns in hotspots; documented patterns in docs/OPTIMIZATION.md.
+
+## Stress Testing (Escrows at Scale)
+
+This project includes a stress test harness to measure gas, storage, and query-performance when creating large numbers of escrows (10k+). The harness is designed to be generic and works against an HTTP endpoint that exposes escrow creation and query APIs.
+
+Files:
+- `tests/stress/runner.py`: Async Python runner that issues concurrent POST requests to create escrows and records latency, response statuses, and (if returned) gas values.
+- `scripts/stress_test.sh`: Convenience wrapper to run the runner with common options.
+- `tests/stress/results/`: Output directory for JSON result files.
+
+Quick start (prerequisites):
+
+1. Start a local testnet and deploy the escrow contract(s).
+2. Ensure a REST endpoint is available for creating escrows (e.g. `/escrow/create`) and for querying total escrows (e.g. `/escrow/list`).
+3. Install Python dependencies: `pip install -r tests/stress/requirements.txt`.
+
+Run a full-scale test (example):
+
+```bash
+./scripts/stress_test.sh \
+	--endpoint http://127.0.0.1:1317 \
+	--create-path /escrow/create \
+	--query-path /escrow/list \
+	--count 10000 \
+	--concurrency 500
+```
+
+What the runner measures:
+- Request success/failure counts and HTTP status distribution
+- Per-request latency (min/mean/max)
+- Attempts to capture `gas` fields if returned by the REST API
+- Optional post-run query to validate created escrows and capture storage-related details
+
+Interpreting results:
+- `gas_samples_avg` in the output is the mean of any gas values returned by the node per transaction; if empty, gas must be collected from on-chain explorers or the node's tx receipts.
+- Use the `query_result` output to estimate storage growth (e.g., total escrows stored, size hints).
+
+Notes and caveats:
+- The harness is intentionally generic; REST payload structure will vary by deployment. Adjust `--payload-template` accordingly.
+- Running 10k+ transactions will require sufficient disk and node resources; prefer running on a local machine or dedicated perf environment rather than CI.
+- CI includes a small-sample run to verify the harness (see `.github/workflows/stress.yml`).
+
