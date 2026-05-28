@@ -79,6 +79,7 @@ pub enum DataKey {
     ApprovedAsset(Address),
     Timelock,
     Arbitrator(Address),
+    ArbitratorList,
     ArbitratorCompensation,
     Appeal(u32),
 }
@@ -140,6 +141,9 @@ impl GovernanceContract {
 
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorList, &Vec::<Address>::new(&env));
     }
 
     pub fn set_timelock(env: Env, timelock: Address) {
@@ -168,13 +172,13 @@ impl GovernanceContract {
         proposer.require_auth();
         Self::require_initialized(&env);
 
-        let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
+        let mut count: u32 = env.storage().persistent().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
         let now = env.ledger().timestamp();
         let voting_period_secs: u64 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&VOTING_PERIOD_SECS)
             .unwrap_or(DEFAULT_VOTING_PERIOD_SECS);
 
@@ -212,7 +216,7 @@ impl GovernanceContract {
             votes_against: 0,
         };
 
-        env.storage().instance().set(&PROPOSAL_COUNT, &count);
+        env.storage().persistent().set(&PROPOSAL_COUNT, &count);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(count), &proposal);
@@ -302,7 +306,7 @@ impl GovernanceContract {
 
         let quorum_bps: u32 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&QUORUM_BPS)
             .unwrap_or(DEFAULT_QUORUM_BPS);
         let total_votes = proposal
@@ -366,7 +370,7 @@ impl GovernanceContract {
     pub fn cancel_proposal(env: Env, proposal_id: u32) {
         let admin: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&ADMIN)
             .expect("not initialized");
         admin.require_auth();
@@ -393,9 +397,55 @@ impl GovernanceContract {
 
     /// Register an arbitrator for dispute resolution (#470).
     pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) {
-        admin.require_auth();
+        Self::assert_admin(&env, &admin);
         let record = ArbitratorRecord { address: arbitrator.clone(), active: true, cases_handled: 0 };
-        env.storage().persistent().set(&DataKey::Arbitrator(arbitrator), &record);
+        let key = DataKey::Arbitrator(arbitrator.clone());
+        let is_new = !env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &record);
+
+        if is_new {
+            let mut list: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ArbitratorList)
+                .unwrap_or(Vec::new(&env));
+            list.push_back(arbitrator.clone());
+            env.storage().persistent().set(&DataKey::ArbitratorList, &list);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "governance"), Symbol::new(&env, "arbitrator_registered")),
+            arbitrator,
+        );
+    }
+
+    pub fn list_arbitrators(env: Env) -> Vec<ArbitratorRecord> {
+        let mut out = Vec::new(&env);
+        let list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+        for addr in list.iter() {
+            if let Some(record) = env.storage().persistent().get::<_, ArbitratorRecord>(&DataKey::Arbitrator(addr.clone())) {
+                out.push_back(record);
+            }
+        }
+        out
+    }
+
+    pub fn select_arbitrator(env: Env, dispute_id: u64) -> Address {
+        let mut active = Vec::new(&env);
+        for record in Self::list_arbitrators(env.clone()).iter() {
+            if record.active {
+                active.push_back(record.address.clone());
+            }
+        }
+        if active.is_empty() {
+            panic!("no active arbitrators");
+        }
+        let idx = (dispute_id as u32) % active.len();
+        active.get(idx).expect("invalid arbitrator index")
     }
 
     pub fn set_arbitration_compensation(env: Env, admin: Address, amount: i128) {
@@ -427,6 +477,14 @@ impl GovernanceContract {
 
     pub fn resolve_appeal(env: Env, arbitrator: Address, proposal_id: u32) {
         arbitrator.require_auth();
+        let record_check: ArbitratorRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Arbitrator(arbitrator.clone()))
+            .expect("arbitrator not found");
+        if !record_check.active {
+            panic!("arbitrator inactive");
+        }
         let mut appeal: AppealRecord = env.storage().persistent()
             .get(&DataKey::Appeal(proposal_id)).expect("appeal not found");
         appeal.resolved = true;
@@ -469,6 +527,18 @@ impl GovernanceContract {
         }
     }
 
+    fn assert_admin(env: &Env, admin: &Address) {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&ADMIN)
+            .expect("not initialized");
+        if &stored != admin {
+            panic!("unauthorized");
+        }
+    }
+
     fn require_active_proposal(env: &Env, proposal: &Proposal) {
         if proposal.status != ProposalStatus::Active {
             panic!("proposal not active");
@@ -481,7 +551,7 @@ impl GovernanceContract {
 
     #[allow(dead_code)]
     fn token_address(env: &Env) -> Address {
-        env.storage().instance().get(&TOKEN).expect("token not set")
+        env.storage().persistent().get(&TOKEN).expect("token not set")
     }
 
     #[allow(dead_code)]
@@ -668,7 +738,7 @@ mod tests {
         );
 
         token.set_total_supply(&10_000i128);
-        token.set_balance(&voter, &100i128);
+        token.set_balance(&voter, &50i128);
 
         let title = Bytes::from_slice(&env, b"Raise delay");
         let description_hash = BytesN::from_array(&env, &[2u8; 32]);
@@ -724,5 +794,30 @@ mod tests {
 
         gov.vote(&voter, &proposal_id, &true);
         gov.vote(&voter, &proposal_id, &false);
+    }
+
+    #[test]
+    fn test_arbitrator_registry_and_selection() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        gov.register_arbitrator(&admin, &a1);
+        gov.register_arbitrator(&admin, &a2);
+
+        let list = gov.list_arbitrators();
+        assert_eq!(list.len(), 2);
+
+        let selected = gov.select_arbitrator(&7u64);
+        assert!(selected == a1 || selected == a2);
     }
 }
