@@ -35,6 +35,12 @@ Supporting contracts (examples):
 - `health_dashboard`: aggregates metrics across contracts
 - `escrow_factory`: deployment/orchestration for escrow instances
 
+Dispute resolution architecture:
+- `dispute_evidence` stores bounded evidence items per disputed escrow and immutable dispute resolution records.
+- `governance` manages arbitrator registration, active arbitrator discovery, and deterministic arbitrator selection for dispute IDs.
+- `escrow` consumes arbitration outcomes to transition disputed escrows into terminal resolution states.
+- Event stream includes `evidence_submitted` and `dispute_resolved` topics to support off-chain indexing and auditability.
+
 Design rule:
 - Cross-contract consumers mirror escrow struct/status fields for decode stability.
 
