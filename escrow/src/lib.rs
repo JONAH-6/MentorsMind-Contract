@@ -479,7 +479,6 @@ impl EscrowContract {
         );
 
         count
-=======
         Self::_create_escrow_internal(
             env,
             mentor,
@@ -2345,3 +2344,5 @@ mod test {
         env.storage().persistent().get(&MILESTONE_ESCROW_COUNT).unwrap_or(0)
     }
 }
+/// Cache of accrued yield per escrow to avoid repeated get_value calls.
+const YIELD_ACCRUED_CACHE: Symbol = symbol_short!("YLD_ACC");

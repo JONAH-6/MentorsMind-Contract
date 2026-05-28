@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
@@ -30,8 +31,12 @@ pub struct StakeRecord {
     pub mentor: Address,
     pub amount: i128,
     pub staked_at: u64,
-    pub unlock_at: u64,
-    pub tier: u8,
+        // Add cooldown_until timestamp to lock out staking after unstake
+        pub unlock_cooldown_until: Option<u64> = None,
+
+        pub tier: u32,
+    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,8 +48,12 @@ pub struct StakeRecord {
 pub struct StakedEventData {
     pub mentor: Address,
     pub amount: i128,
-    pub unlock_at: u64,
-    pub tier: u8,
+        // Add cooldown_until timestamp to lock out staking after unstake
+        pub unlock_cooldown_until: Option<u64> = None,
+
+        pub tier: u32,
+    }
+    }
 }
 
 #[contracttype]
@@ -64,6 +73,8 @@ pub enum DataKey {
     Admin,
     MNTToken,
     Stake(Address),
+    Stakers,
+    TotalStaked,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +86,7 @@ const TIER_BRONZE: i128 = 100;
 const TIER_SILVER: i128 = 500;
 const TIER_GOLD: i128 = 2_000;
 
-fn compute_tier(amount: i128) -> u8 {
+fn compute_tier(amount: i128) -> u32 {
     if amount >= TIER_GOLD {
         3
     } else if amount >= TIER_SILVER {
@@ -99,11 +110,11 @@ impl StakingContract {
     /// Initialize the staking contract.
     /// Must be called once before any other function.
     pub fn initialize(env: Env, admin: Address, mnt_token: Address) -> Result<(), Error> {
-        if env.storage().persistent().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::MNTToken, &mnt_token);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
         Ok(())
     }
 
@@ -120,7 +131,8 @@ impl StakingContract {
         amount: i128,
         lock_period_days: u32,
     ) -> Result<(), Error> {
-        if !env.storage().persistent().has(&DataKey::Admin) {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "stake"));
+        if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
 
@@ -128,7 +140,11 @@ impl StakingContract {
             return Err(Error::InvalidAmount);
         }
 
-        if env.storage().persistent().has(&DataKey::Stake(mentor.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Stake(mentor.clone()))
+        {
             return Err(Error::AlreadyStaked);
         }
 
@@ -136,7 +152,7 @@ impl StakingContract {
 
         let mnt_token: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::MNTToken)
             .ok_or(Error::NotInitialized)?;
 
@@ -145,8 +161,8 @@ impl StakingContract {
         token_client.transfer(&mentor, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        let lock_seconds = (lock_period_days as u64) * 86_400u64;
-        let unlock_at = now + lock_seconds;
+        let lock_seconds = (lock_period_days as u64).checked_mul(86_400u64).expect("Overflow");
+        let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
         let tier = compute_tier(amount);
 
         let record = StakeRecord {
@@ -160,6 +176,26 @@ impl StakingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Stake(mentor.clone()), &record);
+
+        // Update stakers list and total staked
+        let mut stakers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !stakers.contains(&mentor) {
+            stakers.push_back(mentor.clone());
+            env.storage().persistent().set(&DataKey::Stakers, &stakers);
+        }
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalStaked, &(total_staked.checked_add(amount).expect("Overflow")));
 
         env.events().publish(
             (
@@ -185,7 +221,8 @@ impl StakingContract {
     ///
     /// Auth: `mentor` must authorize this call.
     pub fn unstake(env: Env, mentor: Address) -> Result<(), Error> {
-        if !env.storage().persistent().has(&DataKey::Admin) {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "unstake"));
+        if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
 
@@ -204,7 +241,7 @@ impl StakingContract {
 
         let mnt_token: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::MNTToken)
             .ok_or(Error::NotInitialized)?;
 
@@ -214,6 +251,26 @@ impl StakingContract {
         env.storage()
             .persistent()
             .remove(&DataKey::Stake(mentor.clone()));
+
+        // Update stakers list and total staked
+        let mut stakers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if let Some(index) = stakers.first_index_of(&mentor) {
+            stakers.remove(index);
+            env.storage().persistent().set(&DataKey::Stakers, &stakers);
+        }
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalStaked, &(total_staked.checked_sub(record.amount).expect("Underflow")));
 
         env.events().publish(
             (
@@ -240,11 +297,27 @@ impl StakingContract {
 
     /// Return the tier for a mentor.
     /// 0 = None, 1 = Bronze, 2 = Silver, 3 = Gold
-    pub fn get_tier(env: Env, mentor: Address) -> u8 {
+    pub fn get_tier(env: Env, mentor: Address) -> u32 {
         env.storage()
             .persistent()
             .get::<DataKey, StakeRecord>(&DataKey::Stake(mentor))
             .map(|r| r.tier)
+            .unwrap_or(0)
+    }
+
+    /// Return all current stakers.
+    pub fn get_stakers(env: Env) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Return the total amount staked in the contract.
+    pub fn get_total_staked(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
             .unwrap_or(0)
     }
 }
@@ -324,9 +397,7 @@ mod test {
             let mnt_id = env.register_contract(None, MockMNT);
 
             let staking_id = env.register_contract(None, StakingContract);
-            StakingContractClient::new(&env, &staking_id)
-                .initialize(&admin, &mnt_id)
-                .unwrap();
+            StakingContractClient::new(&env, &staking_id).initialize(&admin, &mnt_id);
 
             Fixture {
                 env,
@@ -359,10 +430,10 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 50);
 
-        f.client().stake(&mentor, &50, &30).unwrap();
+        f.client().stake(&mentor, &50, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 0);
-        let record = f.client().get_stake(&mentor).unwrap();
+        let record = f.client().get_stake(&mentor);
         assert_eq!(record.amount, 50);
         assert_eq!(record.tier, 0);
     }
@@ -373,7 +444,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 100);
 
-        f.client().stake(&mentor, &100, &30).unwrap();
+        f.client().stake(&mentor, &100, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 1);
     }
@@ -384,7 +455,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 2);
     }
@@ -395,7 +466,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 2_000);
 
-        f.client().stake(&mentor, &2_000, &30).unwrap();
+        f.client().stake(&mentor, &2_000, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 3);
     }
@@ -408,9 +479,9 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &10).unwrap();
+        f.client().stake(&mentor, &500, &10);
 
-        let record = f.client().get_stake(&mentor).unwrap();
+        let record = f.client().get_stake(&mentor);
         // 10 days * 86400 seconds
         assert_eq!(record.unlock_at, 1_000_000 + 10 * 86_400);
     }
@@ -421,7 +492,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 1_000);
 
-        f.client().stake(&mentor, &1_000, &30).unwrap();
+        f.client().stake(&mentor, &1_000, &30);
 
         assert_eq!(f.mnt().balance(&mentor), 0);
         assert_eq!(f.mnt().balance(&f.staking_id), 1_000);
@@ -433,7 +504,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 2_000);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         let result = f.client().try_stake(&mentor, &500, &30);
         assert_eq!(result, Err(Ok(Error::AlreadyStaked)));
@@ -460,12 +531,12 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         // Advance past lock period
         f.env.ledger().set_timestamp(30 * 86_400 + 1);
 
-        f.client().unstake(&mentor).unwrap();
+        f.client().unstake(&mentor);
 
         assert_eq!(f.mnt().balance(&mentor), 500);
         assert_eq!(f.mnt().balance(&f.staking_id), 0);
@@ -483,7 +554,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         // Only 1 day has passed — still locked
         f.env.ledger().set_timestamp(86_400);
@@ -519,9 +590,7 @@ mod test {
     #[test]
     fn test_initialize_rejects_double_init() {
         let f = Fixture::setup();
-        let result = f
-            .client()
-            .try_initialize(&f.admin, &f.mnt_id);
+        let result = f.client().try_initialize(&f.admin, &f.mnt_id);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
     }
 }

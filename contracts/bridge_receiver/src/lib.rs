@@ -1,8 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec};
 
 #[derive(Clone)]
 #[contracttype]
@@ -46,9 +44,9 @@ impl BridgeReceiver {
             supported_chains: Vec::new(&env),
             processed_vaas: Vec::new(&env),
         };
-        
+
         env.storage().instance().set(&DataKey::Config, &config);
-        
+
         // Initialize with default supported chains
         let mut chains = Vec::new(&env);
         chains.push_back(CHAIN_ETHEREUM);
@@ -60,7 +58,9 @@ impl BridgeReceiver {
     /// Set the wrapped token contract address
     pub fn set_wrapped_token(env: Env, admin: Address, token_address: Address) {
         Self::require_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::WrappedToken, &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::WrappedToken, &token_address);
     }
 
     /// Receive a bridged asset from another chain via Wormhole
@@ -78,7 +78,10 @@ impl BridgeReceiver {
 
         // Check if source chain is supported
         let config = Self::get_config(&env);
-        let is_supported = config.supported_chains.iter().any(|chain| chain == source_chain);
+        let is_supported = config
+            .supported_chains
+            .iter()
+            .any(|chain| chain == source_chain);
         if !is_supported {
             panic!("Source chain {} is not supported", source_chain);
         }
@@ -104,13 +107,13 @@ impl BridgeReceiver {
 
         // Mint equivalent wrapped token to recipient
         let token_client = token::Client::new(&env, &token_address);
-        
+
         // Authorize the bridge contract to mint
         token_client.mint(&recipient, &amount);
 
         // Mark VAA as processed to prevent replay
         env.storage().instance().set(&processed_key, &true);
-        
+
         // Also store in config's processed_vaas list for audit
         let mut config = Self::get_config(&env);
         config.processed_vaas.push_back(vaa_hash.clone());
@@ -131,20 +134,20 @@ impl BridgeReceiver {
     fn verify_vaa_hash(env: &Env, vaa_hash: &BytesN<32>) {
         // In production, this would verify against Wormhole guardian set
         // For MVP, check against admin-approved VAA hashes
-        
+
         let approved_hashes: Vec<BytesN<32>> = env
             .storage()
             .instance()
             .get(&DataKey::ProcessedVAA(*vaa_hash))
             .map_or(Vec::new(env), |_| Vec::new(env));
-        
+
         // Simplified: For now, accept all hashes that haven't been processed
         // In production, implement actual Wormhole VAA verification:
         // - Verify guardian signatures
         // - Check VAA timestamp
         // - Validate emitter address
         // - Verify chain ID matches
-        
+
         // This is a placeholder - production should use actual Wormhole verification
         // For MVP, we trust that the VAA has been verified by the caller
         // and we're just preventing replays
@@ -159,15 +162,18 @@ impl BridgeReceiver {
     /// Add a supported chain (admin only)
     pub fn add_supported_chain(env: Env, admin: Address, chain_id: u32) {
         Self::require_admin(&env, &admin);
-        
+
         let mut config = Self::get_config(&env);
-        
+
         // Check if chain already exists
-        let exists = config.supported_chains.iter().any(|chain| chain == chain_id);
+        let exists = config
+            .supported_chains
+            .iter()
+            .any(|chain| chain == chain_id);
         if exists {
             panic!("Chain {} already supported", chain_id);
         }
-        
+
         config.supported_chains.push_back(chain_id);
         env.storage().instance().set(&DataKey::Config, &config);
     }
@@ -175,9 +181,9 @@ impl BridgeReceiver {
     /// Remove a supported chain (admin only)
     pub fn remove_supported_chain(env: Env, admin: Address, chain_id: u32) {
         Self::require_admin(&env, &admin);
-        
+
         let mut config = Self::get_config(&env);
-        
+
         // Filter out the chain to remove
         let mut new_chains = Vec::new(&env);
         for chain in config.supported_chains.iter() {
@@ -185,7 +191,7 @@ impl BridgeReceiver {
                 new_chains.push_back(chain);
             }
         }
-        
+
         config.supported_chains = new_chains;
         env.storage().instance().set(&DataKey::Config, &config);
     }
@@ -235,16 +241,13 @@ impl BridgeReceiver {
             source_chain,
             wrapped_token: wrapped_token.clone(),
         };
-        
-        env.events().publish(
-            ("bridge", "asset_bridged"),
-            event,
-        );
+
+        env.events().publish(("bridge", "asset_bridged"), event);
     }
 
     fn set_supported_chains(env: Env, admin: Address, chains: Vec<u32>) {
         Self::require_admin(&env, &admin);
-        
+
         let mut config = Self::get_config(&env);
         config.supported_chains = chains;
         env.storage().instance().set(&DataKey::Config, &config);
@@ -261,9 +264,9 @@ mod test {
     fn test_init() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         let supported_chains = BridgeReceiverClient::get_supported_chains(&env);
         assert_eq!(supported_chains.len(), 3);
         assert_eq!(supported_chains.get(0).unwrap(), CHAIN_ETHEREUM);
@@ -276,12 +279,12 @@ mod test {
     fn test_receive_without_wrapped_token() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         let vaa_hash = BytesN::from_array(&env, &[0; 32]);
         let recipient = Address::generate(&env);
-        
+
         BridgeReceiverClient::receive_bridged_asset(
             &env,
             &vaa_hash,
@@ -295,12 +298,12 @@ mod test {
     fn test_add_supported_chain() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         let new_chain = 5; // Arbitrum
         BridgeReceiverClient::add_supported_chain(&env, &admin, &new_chain);
-        
+
         let chains = BridgeReceiverClient::get_supported_chains(&env);
         assert_eq!(chains.len(), 4);
         assert_eq!(chains.get(3).unwrap(), new_chain);
@@ -312,9 +315,9 @@ mod test {
         let env = Env::default();
         let admin = Address::generate(&env);
         let unauthorized = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         BridgeReceiverClient::add_supported_chain(&env, &unauthorized, &5);
     }
 
@@ -322,14 +325,14 @@ mod test {
     fn test_remove_supported_chain() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         BridgeReceiverClient::remove_supported_chain(&env, &admin, &CHAIN_SOLANA);
-        
+
         let chains = BridgeReceiverClient::get_supported_chains(&env);
         assert_eq!(chains.len(), 2);
-        
+
         let contains_solana = chains.iter().any(|c| c == CHAIN_SOLANA);
         assert!(!contains_solana);
     }
@@ -339,22 +342,18 @@ mod test {
     fn test_receive_unsupported_chain() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         // Set a dummy wrapped token
         let token = Address::generate(&env);
         BridgeReceiverClient::set_wrapped_token(&env, &admin, &token);
-        
+
         let vaa_hash = BytesN::from_array(&env, &[0; 32]);
         let recipient = Address::generate(&env);
-        
+
         BridgeReceiverClient::receive_bridged_asset(
-            &env,
-            &vaa_hash,
-            &recipient,
-            &1000,
-            &99, // Unsupported chain
+            &env, &vaa_hash, &recipient, &1000, &99, // Unsupported chain
         );
     }
 
@@ -363,16 +362,16 @@ mod test {
     fn test_replay_attack_prevention() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        
+
         BridgeReceiverClient::init(&env, &admin);
-        
+
         // Set a dummy wrapped token
         let token = Address::generate(&env);
         BridgeReceiverClient::set_wrapped_token(&env, &admin, &token);
-        
+
         let vaa_hash = BytesN::from_array(&env, &[1; 32]);
         let recipient = Address::generate(&env);
-        
+
         // First receive - should succeed
         BridgeReceiverClient::receive_bridged_asset(
             &env,
@@ -381,7 +380,7 @@ mod test {
             &1000,
             &CHAIN_ETHEREUM,
         );
-        
+
         // Second receive with same VAA - should fail
         BridgeReceiverClient::receive_bridged_asset(
             &env,

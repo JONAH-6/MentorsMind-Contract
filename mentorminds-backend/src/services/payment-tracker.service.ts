@@ -1,4 +1,5 @@
 import { Payment, PaymentStatus } from '../types/payment.types';
+import { verifyHorizonTransaction } from '../utils/horizon-tx-verifier';
 
 // In-memory store — replace with real DB (Prisma/TypeORM) in production
 const payments = new Map<string, Payment>();
@@ -65,6 +66,34 @@ export class PaymentTrackerService {
 
   async getAll(): Promise<Payment[]> {
     return [...payments.values()];
+  }
+
+  /**
+   * Confirms a payment after verifying the transaction on Horizon.
+   *
+   * Verifies:
+   *  1. The transaction exists and was successful on Horizon.
+   *  2. The transaction source account matches the payment's senderAddress.
+   *  3. At least one payment operation sends the correct amount of the correct
+   *     asset to the payment's receiverAddress.
+   *
+   * Throws if any verification fails — the payment is NOT marked confirmed.
+   */
+  async confirmPayment(id: string): Promise<Payment | null> {
+    const payment = payments.get(id);
+    if (!payment) return null;
+    if (!payment.txHash) {
+      throw new Error(`Payment ${id} has no txHash to verify`);
+    }
+
+    await verifyHorizonTransaction(payment.txHash, {
+      expectedSourceAccount: payment.senderAddress,
+      expectedDestination: payment.receiverAddress,
+      expectedAmount: payment.amount,
+      expectedAssetCode: payment.assetCode,
+    });
+
+    return this.updateStatus(id, 'confirmed');
   }
 }
 

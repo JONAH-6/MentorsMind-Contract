@@ -1,7 +1,7 @@
 #![cfg(test)]
 
-use soroban_sdk::{symbol_short, Address, Env, Symbol};
 use crate::{EscrowFactory, EscrowInfo};
+use soroban_sdk::{symbol_short, Address, Env, Symbol};
 
 use soroban_sdk::contractclient;
 
@@ -92,7 +92,10 @@ fn test_deploy_escrow() {
     );
 
     // Verify escrow address is stored
-    assert_eq!(client.get_escrow_address(&session_id), Some(escrow_address.clone()));
+    assert_eq!(
+        client.get_escrow_address(&session_id),
+        Some(escrow_address.clone())
+    );
 
     // Verify escrow count increased
     assert_eq!(client.get_escrow_count(), 1);
@@ -100,7 +103,7 @@ fn test_deploy_escrow() {
     // Verify escrow is in the list
     let escrows = client.get_all_escrows(&1, &10);
     assert_eq!(escrows.len(), 1);
-    
+
     let escrow_info = escrows.get(0).unwrap();
     assert_eq!(escrow_info.address, escrow_address);
     assert_eq!(escrow_info.session_id, session_id);
@@ -135,7 +138,7 @@ fn test_deploy_duplicate_session_id() {
             &session_id,
         );
     }));
-    
+
     assert!(result.is_err());
 }
 
@@ -195,7 +198,7 @@ fn test_upgrade_implementation() {
     let client = test.factory_client();
 
     let new_implementation = Address::generate(&test.env);
-    
+
     // Only admin can upgrade
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.upgrade_implementation(&new_implementation);
@@ -203,7 +206,9 @@ fn test_upgrade_implementation() {
     assert!(result.is_err());
 
     // Test successful upgrade by admin
-    client.with_source_account(&test.admin).upgrade_implementation(&new_implementation);
+    client
+        .with_source_account(&test.admin)
+        .upgrade_implementation(&new_implementation);
     assert_eq!(client.get_implementation(), new_implementation);
 }
 
@@ -225,7 +230,7 @@ fn test_multiple_escrows_lookup() {
             &test.token,
             &session_id,
         );
-        
+
         session_ids.push_back(session_id);
         escrow_addresses.push_back(escrow_address);
     }
@@ -234,7 +239,10 @@ fn test_multiple_escrows_lookup() {
     for i in 0..5 {
         let session_id = session_ids.get(i).unwrap();
         let expected_address = escrow_addresses.get(i).unwrap();
-        assert_eq!(client.get_escrow_address(session_id), Some(expected_address.clone()));
+        assert_eq!(
+            client.get_escrow_address(session_id),
+            Some(expected_address.clone())
+        );
     }
 
     // Verify all escrows are in the list

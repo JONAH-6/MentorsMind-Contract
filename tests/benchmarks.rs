@@ -6,9 +6,7 @@ use soroban_sdk::{
     token::{Client as TokenClient, StellarAssetClient},
     IntoVal,
 };
-use mentorminds_escrow::{
-    Escrow, EscrowContract, EscrowContractClient, EscrowStatus,
-};
+use mentorminds_escrow::{Escrow, EscrowContract, EscrowContractClient, EscrowParams, EscrowStatus};
 
 // ============================================================================
 // Benchmark Infrastructure
@@ -83,7 +81,7 @@ impl BenchmarkFixture {
         let client = EscrowContractClient::new(&env, &contract_id);
         let mut approved = Vec::new(&env);
         approved.push_back(token_address.clone());
-        client.initialize(&admin, &treasury, &500, &approved, &0);
+        client.initialize(&admin, &treasury, &500, &approved, &0, &None);
 
         Self {
             env,
@@ -129,6 +127,7 @@ fn benchmark_create_escrow() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     // Benchmark: create_escrow with token transfer
@@ -140,6 +139,7 @@ fn benchmark_create_escrow() {
         &symbol_short!("sess2"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
     let end_count = fixture.get_escrow_count();
 
@@ -168,6 +168,7 @@ fn benchmark_release_funds_with_fee() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     let escrow_id = fixture.get_escrow_count();
@@ -210,11 +211,12 @@ fn benchmark_get_escrows_by_mentor_100() {
             &session_sym,
             &fixture.token_address,
             &session_end_time,
+            &1u32,
         );
     }
 
     // Benchmark: retrieve all escrows for mentor
-    let escrows = fixture.client.get_escrows_by_mentor(&fixture.mentor);
+    let escrows = fixture.client.get_escrows_by_mentor(&fixture.mentor, &0u32, &100u32);
 
     assert_eq!(escrows.len(), 100, "Should retrieve all 100 escrows");
 
@@ -241,6 +243,7 @@ fn benchmark_submit_review_cross_contract() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     let escrow_id = fixture.get_escrow_count();
@@ -274,6 +277,7 @@ fn benchmark_dispute() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     let escrow_id = fixture.get_escrow_count();
@@ -308,6 +312,7 @@ fn benchmark_resolve_dispute_50_50() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     let escrow_id = fixture.get_escrow_count();
@@ -315,8 +320,8 @@ fn benchmark_resolve_dispute_50_50() {
     // Open dispute
     fixture.client.dispute(&fixture.learner, &escrow_id, &symbol_short!("DISPUTE"));
 
-    // Benchmark: resolve dispute with 50/50 split
-    fixture.client.resolve_dispute(&fixture.admin, &escrow_id, &50);
+    // Benchmark: resolve dispute (release to mentor with fee)
+    fixture.client.resolve_dispute(&escrow_id, &true);
 
     // Verify status changed
     let escrow = fixture.client.get_escrow(&escrow_id);
@@ -345,6 +350,7 @@ fn benchmark_try_auto_release() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     let escrow_id = fixture.get_escrow_count();
@@ -382,6 +388,7 @@ fn benchmark_refund() {
         &symbol_short!("sess1"),
         &fixture.token_address,
         &session_end_time,
+        &1u32,
     );
 
     let escrow_id = fixture.get_escrow_count();
@@ -390,7 +397,7 @@ fn benchmark_refund() {
     fixture.client.dispute(&fixture.learner, &escrow_id, &symbol_short!("DISPUTE"));
 
     // Benchmark: admin refund
-    fixture.client.refund(&fixture.admin, &escrow_id);
+    fixture.client.refund(&escrow_id);
 
     // Verify status changed
     let escrow = fixture.client.get_escrow(&escrow_id);

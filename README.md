@@ -10,6 +10,14 @@ This repository contains the Soroban smart contracts that power the MentorMinds 
 - **Multi-Sig Wallet**: Multi-signature wallet for platform administration
 - **Payment Router**: Automated payment distribution and fee collection
 
+## 📘 Documentation Hub
+
+- Deployment: `docs/DEPLOYMENT_GUIDE.md`
+- State transitions: `docs/STATE_MACHINE.md`
+- Architecture: `ARCHITECTURE.md`
+- Troubleshooting: `docs/TROUBLESHOOTING.md`
+- FAQ: `docs/FAQ.md`
+
 ## 📋 Prerequisites
 
 - **Rust** 1.70+ with wasm32 target
@@ -148,6 +156,23 @@ soroban contract optimize --wasm target/wasm32-unknown-unknown/release/escrow.wa
 
 ## 🚀 Deployment
 
+Recommended deployment path (all environments):
+
+```bash
+./scripts/deploy.sh --network testnet --identity default
+./scripts/deploy.sh --network mainnet --identity production --validation-cloud-key "$VALIDATION_CLOUD_KEY"
+```
+
+Deployment details, initialization workflow, config flags, and checklists are documented in `docs/DEPLOYMENT_GUIDE.md`.
+
+Architecture and diagram references:
+- `ARCHITECTURE.md`
+- `docs/diagrams/`
+
+Escrow lifecycle and state machine details:
+- `docs/STATE_MACHINE.md`
+- `contracts/escrow/INVARIANTS.md`
+
 ### Deploy to Testnet
 ```bash
 # Deploy escrow contract
@@ -218,6 +243,32 @@ soroban contract invoke \
 - **Input Validation**: Validate all inputs
 - **Emergency Pause**: Implement pause mechanism
 - **Upgrade Path**: Plan for contract upgrades
+
+## 🔄 State Machine Methodology
+
+MentorMinds contracts use a formal state machine methodology to ensure secure and predictable state transitions.
+
+### 📐 Principles
+- **Explicit States**: All possible contract states are defined as `contracttype` enums.
+- **Valid Transitions**: Only pre-defined transitions between states are permitted.
+- **Shared Trait**: The `StateMachine` trait in `contracts/shared` enforces a consistent `is_valid_transition` method across all contracts.
+- **Exhaustive Testing**: State machine transitions are verified by exhaustive tests in `tests/state_machine_tests.rs`, covering every possible (from, to) state pair.
+
+### 📋 Usage Example
+```rust
+impl StateMachine for EscrowStatus {
+    fn is_valid_transition(env: &Env, from: &Self, to: &Self) -> bool {
+        match (from, to) {
+            (EscrowStatus::Active, EscrowStatus::Released) => true,
+            (EscrowStatus::Active, EscrowStatus::Disputed) => true,
+            // ... other valid transitions
+            _ => false,
+        }
+    }
+}
+```
+
+For detailed specifications and diagrams, see [docs/state-machines.md](docs/state-machines.md).
 
 ## 🔁 Upgrade Procedure
 
@@ -302,7 +353,9 @@ MIT License - see LICENSE file for details
 ## 🆘 Support
 
 For issues and questions:
-- Create an issue on GitHub
+- Check troubleshooting first: `docs/TROUBLESHOOTING.md`
+- Check common questions: `docs/FAQ.md`
+- Create an issue on GitHub with command, network, logs, and commit SHA
 - Join Stellar Discord
 - Check Soroban documentation
 
