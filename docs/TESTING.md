@@ -15,6 +15,8 @@ This repository uses layered Rust tests to validate contract behavior before dep
 - Upgrade and version tracking behavior.
 - Oracle, risk, and dispute scenarios that can regress silently if left untested.
 - Event emission correctness and ordering for state-changing operations (`tests/events/`).
+- Event emission correctness and ordering checks (`tests/events/`).
+- TTL bumping and persistence checks for long-lived storage keys (`tests/ttl/`).
 
 ## Testing Guidelines
 

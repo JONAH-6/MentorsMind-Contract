@@ -5,6 +5,7 @@ This document defines escrow invariants and state transition constraints that mu
 ## Escrow States
 
 Escrow status mirrors used across contracts:
+- `Pending`
 - `Active`
 - `Disputed`
 - `Released`
@@ -19,22 +20,28 @@ Terminal states:
 ## Transition Rules
 
 Valid transitions:
+- `Pending -> Active`
+- `Pending -> Refunded`
 - `Active -> Released`
 - `Active -> Disputed`
 - `Active -> Refunded`
 - `Disputed -> Resolved`
+- `Disputed -> Refunded`
 
 Invalid transitions (examples):
 - `Released -> Active`
 - `Refunded -> Active`
 - `Resolved -> Active`
 - `Disputed -> Active`
+- `Active -> Pending`
 
 Transition guards:
+- `Pending -> Active`: learner deposits funds successfully
 - `Active -> Released`: authorized release, or delay condition for auto-release
 - `Active -> Disputed`: authorized participant challenge
 - `Active -> Refunded`: admin workflow
 - `Disputed -> Resolved`: administrative/arbitration resolution
+- `Disputed -> Refunded`: admin refund from disputed state
 
 ## Invariant 1: Token Balance Consistency
 
