@@ -52,3 +52,11 @@ path = "oracle_manipulation_tests.rs"
 [[test]]
 name = "sig_validation_tests"
 path = "sig_validation_tests.rs"
+
+[[test]]
+name = "cancellation_tests"
+path = "cancellation/mod.rs"
+
+[[test]]
+name = "multi_mentor_tests"
+path = "multi_mentor/mod.rs"
