@@ -278,6 +278,22 @@ impl UpgradeRegistryContract {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
     }
+
+    /// Check whether a contract meets a minimum required version.
+    /// Returns true if the contract's latest version >= min_version.
+    pub fn check_min_version(env: Env, contract_name: Symbol, min_version: u32) -> bool {
+        let latest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(contract_name))
+            .unwrap_or(0u32);
+        latest >= min_version
+    }
+
+    /// Returns the registry contract's own version constant.
+    pub fn registry_version(_env: Env) -> u32 {
+        1
+    }
 }
 
 // ---------------------------------------------------------------------------
