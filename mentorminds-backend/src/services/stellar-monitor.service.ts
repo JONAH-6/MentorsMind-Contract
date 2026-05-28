@@ -1,6 +1,5 @@
 import { paymentTrackerService } from './payment-tracker.service';
 import { startRateRefresh } from './exchange-rate.service';
-import { getRedisClient } from './redis.service';
 
 declare const process: {
   env: Record<string, string | undefined>;
@@ -26,7 +25,7 @@ class StellarMonitorService {
   private stopStream: StreamStopFn | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
 
-  async fetchTransaction(txHash: string): Promise<{ successful: boolean; ledger: number; result_code?: string } | null> {
+  async fetchTransaction(txHash: string): Promise<{ successful: boolean; ledger: number; fee_paid?: string; result_code?: string } | null> {
     const res = await fetch(`${HORIZON_URL}/transactions/${txHash}`);
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`Horizon error: ${res.status}`);
@@ -35,6 +34,7 @@ class StellarMonitorService {
     return {
       successful: data.successful,
       ledger: data.ledger,
+      fee_paid: data.fee_paid,
       result_code: data.result_codes?.transaction,
     };
   }
@@ -49,64 +49,29 @@ class StellarMonitorService {
       if (tx.successful) {
         await paymentTrackerService.updateStatus(payment.id, 'confirmed', {
           ledgerSequence: tx.ledger,
+          fee: tx.fee_paid,
         });
       } else {
         const errorCode = tx.result_code ?? 'tx_failed';
         await paymentTrackerService.updateStatus(payment.id, 'failed', {
           ledgerSequence: tx.ledger,
+          fee: tx.fee_paid,
           errorCode,
           errorMessage: RESULT_CODE_MESSAGES[errorCode] ?? 'Transaction failed.',
         });
-async function fetchTransaction(txHash: string): Promise<{ successful: boolean; ledger: number; fee_paid?: string; result_code?: string } | null> {
-  const res = await fetch(`${HORIZON_URL}/transactions/${txHash}`);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Horizon error: ${res.status}`);
-
-  const data = await res.json();
-  return {
-    successful: data.successful,
-    ledger: data.ledger,
-    fee_paid: data.fee_paid,
-    result_code: data.result_codes?.transaction,
-  };
-}
-
-async function pollPending(): Promise<void> {
-  const pending = await paymentTrackerService.findPending();
-
-  await Promise.allSettled(
-    pending.map(async (payment) => {
-      if (!payment.txHash) return;
-
-      try {
-        const tx = await fetchTransaction(payment.txHash);
-        if (!tx) return; // not yet on ledger
-
-        if (tx.successful) {
-          await paymentTrackerService.updateStatus(payment.id, 'confirmed', {
-            ledgerSequence: tx.ledger,
-            fee: tx.fee_paid,
-          });
-        } else {
-          const errorCode = tx.result_code ?? 'tx_failed';
-          await paymentTrackerService.updateStatus(payment.id, 'failed', {
-            ledgerSequence: tx.ledger,
-            fee: tx.fee_paid,
-            errorCode,
-            errorMessage: RESULT_CODE_MESSAGES[errorCode] ?? 'Transaction failed.',
-          });
-        }
-      } catch {
-        // transient error — will retry next poll cycle
       }
     } catch {
       // transient error — will retry next poll cycle
     }
   }
 
+  /**
+   * Polls pending escrows only when streaming is not active.
+   * The streamActive guard prevents duplicate processing when both
+   * stream and poll would otherwise run simultaneously.
+   */
   async pollPending(): Promise<void> {
     if (this.streamActive) {
-      console.log('Skipping poll: stream is active');
       return;
     }
 
@@ -121,21 +86,24 @@ async function pollPending(): Promise<void> {
     await paymentTrackerService.timeoutStalePending();
   }
 
+  /**
+   * Starts polling only when streaming is not active.
+   * If streaming succeeded, this is a no-op — preventing the duplicate
+   * processing bug described in issue #300.
+   */
   startPendingEscrowPolling(): void {
     if (this.streamActive) {
-      console.log('Polling not started: stream is already active');
       return;
     }
 
     if (this.pollTimer) {
-      console.log('Polling already running');
       return;
     }
 
     this.pollTimer = setInterval(async () => {
       await this.pollPending();
     }, POLL_INTERVAL_MS);
-    
+
     console.log(`Stellar monitor polling started (poll every ${POLL_INTERVAL_MS / 1000}s)`);
   }
 
@@ -143,16 +111,12 @@ async function pollPending(): Promise<void> {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
-      console.log('Stellar monitor polling stopped');
     }
   }
 
   async startStreamPendingEscrows(): Promise<StreamStopFn> {
-    // Simulate streaming connection to Horizon
-    // In production, this would use Server-sent Events or WebSocket
     console.log('Starting stream for pending escrows...');
-    
-    // Simulate async stream initialization
+
     return new Promise((resolve, reject) => {
       setTimeout(() => {
         try {
@@ -167,6 +131,14 @@ async function pollPending(): Promise<void> {
     });
   }
 
+  /**
+   * Attempts to start streaming first. Falls back to polling only on failure.
+   *
+   * Fix for issue #300: polling is started exclusively in the catch block so
+   * it never runs simultaneously with an active stream. The streamActive flag
+   * is set to true before the stream attempt and cleared on failure so that
+   * startPendingEscrowPolling() can proceed.
+   */
   async startPendingEscrowMonitoring(): Promise<void> {
     this.streamActive = true;
 
@@ -201,24 +173,15 @@ async function pollPending(): Promise<void> {
 
 export const stellarMonitorService = new StellarMonitorService();
 
-// Keep backward compatibility
 export function startStellarMonitor(): void {
   stellarMonitorService.startPendingEscrowMonitoring();
-let stellarMonitorHandle: ReturnType<typeof setInterval> | null = null;
 
-export function startStellarMonitor(): void {
-  stellarMonitorHandle = setInterval(pollPending, POLL_INTERVAL_MS);
-  console.log(`Stellar monitor started (poll every ${POLL_INTERVAL_MS / 1000}s)`);
-  
   // Start the exchange rate refresh service with distributed lock
   startRateRefresh();
 }
 
 export function stopStellarMonitor(): void {
-  if (stellarMonitorHandle !== null) {
-    clearInterval(stellarMonitorHandle);
-    stellarMonitorHandle = null;
-  }
+  stellarMonitorService.stopMonitoring();
 }
 
 export async function processWebhookEvent(payload: {

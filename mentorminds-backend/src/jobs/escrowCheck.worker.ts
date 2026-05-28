@@ -1,13 +1,67 @@
 import { Pool } from 'pg';
+import {
+  EscrowReleaseService,
+  EscrowReadRepository,
+  EscrowWriteRepository,
+  EscrowReleaseRecord,
+  InternalReleasePolicy,
+} from '../services/escrow-release.service';
 
 const RELEASE_WINDOW_HOURS = 48;
 const MAX_ESCROW_AGE_DAYS = 30; // FIX #260: Upper bound on escrow age
 const MAX_RELEASE_ATTEMPTS = 5; // FIX #260: Max retry attempts
 const RETRY_COOLDOWN_HOURS = 1; // FIX #260: Cooldown between retry attempts
 
-export class EscrowCheckWorker {
+const SYSTEM_USER_ID = 'system';
+
+/** Messages that indicate the escrow is already in a terminal state — skip, don't error. */
+function isSkippableReleaseError(msg: string): boolean {
+  return (
+    msg.includes('Cannot release escrow') ||
+    msg.includes('Only the learner can release funds')
+  );
+}
+
+/** DB-backed read repository for EscrowReleaseService. */
+class PgEscrowReadRepository implements EscrowReadRepository {
   constructor(private readonly pool: Pool) {}
 
+  async findById(id: string): Promise<EscrowReleaseRecord | null> {
+    const result = await this.pool.query(
+      `SELECT id, learner_id AS "learnerId", status FROM escrows WHERE id = $1`,
+      [id]
+    );
+    return result.rows[0] ?? null;
+  }
+}
+
+/** DB-backed write repository for EscrowReleaseService. */
+class PgEscrowWriteRepository implements EscrowWriteRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async markReleased(id: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE escrows SET status = 'released' WHERE id = $1`,
+      [id]
+    );
+  }
+}
+
+/** System callers (workers) are trusted to bypass the learner-only guard. */
+const systemReleasePolicy: InternalReleasePolicy = {
+  isTrustedSystemCaller: (callerId: string) => callerId === SYSTEM_USER_ID,
+};
+
+export class EscrowCheckWorker {
+  private readonly releaseService: EscrowReleaseService;
+
+  constructor(private readonly pool: Pool) {
+    this.releaseService = new EscrowReleaseService(
+      new PgEscrowReadRepository(pool),
+      new PgEscrowWriteRepository(pool),
+      systemReleasePolicy
+    );
+  }
   /**
    * Checks for escrows that have exceeded the release window and triggers auto-release.
    * 
@@ -71,13 +125,26 @@ export class EscrowCheckWorker {
          WHERE id = $1`,
         [escrow.id]
       );
-      
-      // TODO: Actual Soroban contract call here
-      // const result = await sorobanClient.releaseEscrow(escrow.id);
-      
-      // On success, update status
-      // await this.pool.query("UPDATE escrows SET status = 'released' WHERE id = $1", [escrow.id]);
+
+      // FIX #290: Use EscrowReleaseService with bypassOwnerCheck: true so the
+      // system caller is not blocked by the learner-only guard.
+      // bypassOwnerCheck is validated against systemReleasePolicy — it is never
+      // reachable from the HTTP API layer.
+      await this.releaseService.releaseEscrow(escrow.id, SYSTEM_USER_ID, {
+        bypassOwnerCheck: true,
+      });
+
+      console.log(`[EscrowCheckWorker] Auto-released escrow ${escrow.id}`);
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+
+      // FIX #290: Treat "Cannot release escrow" AND "Only the learner can release
+      // funds" as skippable — the escrow is already in a terminal state.
+      if (isSkippableReleaseError(msg)) {
+        console.log(`[EscrowCheckWorker] Skipping escrow ${escrow.id}: ${msg}`);
+        return;
+      }
+
       console.error(`[EscrowCheckWorker] Failed to release escrow ${escrow.id}:`, error);
       
       // Check if max attempts reached

@@ -78,6 +78,27 @@ pub enum DataKey {
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
     Timelock,
+    Arbitrator(Address),
+    ArbitratorCompensation,
+    Appeal(u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorRecord {
+    pub address: Address,
+    pub active: bool,
+    pub cases_handled: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealRecord {
+    pub proposal_id: u32,
+    pub appellant: Address,
+    pub reason: soroban_sdk::String,
+    pub submitted_at: u64,
+    pub resolved: bool,
 }
 
 #[contract]
@@ -127,6 +148,14 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Timelock, &timelock);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "timelock_set"),
+            ),
+            timelock,
+        );
     }
 
     pub fn create_proposal(
@@ -298,10 +327,26 @@ impl GovernanceContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
+            env.events().publish(
+                (
+                    Symbol::new(&env, "governance"),
+                    Symbol::new(&env, "proposal_failed"),
+                    proposal_id,
+                ),
+                (proposal.votes_for, proposal.votes_against, quorum_met),
+            );
             return;
         }
 
         proposal.status = ProposalStatus::Passed;
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "proposal_passed"),
+                proposal_id,
+            ),
+            (proposal.votes_for, proposal.votes_against, quorum_met),
+        );
         Self::apply_action(&env, &proposal.action);
         proposal.status = ProposalStatus::Executed;
         env.storage()
@@ -335,6 +380,66 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "proposal_cancelled"),
+                proposal_id,
+            ),
+            proposal.proposer.clone(),
+        );
+    }
+
+    /// Register an arbitrator for dispute resolution (#470).
+    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        admin.require_auth();
+        let record = ArbitratorRecord { address: arbitrator.clone(), active: true, cases_handled: 0 };
+        env.storage().persistent().set(&DataKey::Arbitrator(arbitrator), &record);
+    }
+
+    pub fn set_arbitration_compensation(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::ArbitratorCompensation, &amount);
+    }
+
+    pub fn get_arbitration_compensation(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::ArbitratorCompensation).unwrap_or(0)
+    }
+
+    pub fn get_arbitrator(env: Env, arbitrator: Address) -> ArbitratorRecord {
+        env.storage().persistent().get(&DataKey::Arbitrator(arbitrator)).expect("arbitrator not found")
+    }
+
+    /// Submit an appeal for a resolved proposal (#469).
+    pub fn submit_appeal(env: Env, appellant: Address, proposal_id: u32, reason: soroban_sdk::String) {
+        appellant.require_auth();
+        let appeal = AppealRecord {
+            proposal_id,
+            appellant,
+            reason,
+            submitted_at: env.ledger().timestamp(),
+            resolved: false,
+        };
+        env.storage().persistent().set(&DataKey::Appeal(proposal_id), &appeal);
+        env.events().publish(("appeal_submitted", proposal_id), ());
+    }
+
+    pub fn resolve_appeal(env: Env, arbitrator: Address, proposal_id: u32) {
+        arbitrator.require_auth();
+        let mut appeal: AppealRecord = env.storage().persistent()
+            .get(&DataKey::Appeal(proposal_id)).expect("appeal not found");
+        appeal.resolved = true;
+        env.storage().persistent().set(&DataKey::Appeal(proposal_id), &appeal);
+        let mut record: ArbitratorRecord = env.storage().persistent()
+            .get(&DataKey::Arbitrator(arbitrator.clone())).expect("arbitrator not found");
+        record.cases_handled += 1;
+        env.storage().persistent().set(&DataKey::Arbitrator(arbitrator), &record);
+        env.events().publish(("appeal_resolved", proposal_id), ());
+    }
+
+    pub fn get_appeal(env: Env, proposal_id: u32) -> AppealRecord {
+        env.storage().persistent().get(&DataKey::Appeal(proposal_id)).expect("appeal not found")
     }
 
     pub fn get_proposal(env: Env, id: u32) -> Proposal {

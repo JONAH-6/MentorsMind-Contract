@@ -317,10 +317,13 @@ fn apply_add_signer(env: &Env, new_signer: Address) -> Result<(), Error> {
     }
     env.storage().persistent().set(&DataKey::Signer(new_signer.clone()), &true);
     let count: u32 = env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0);
-    env.storage().instance().set(&DataKey::SignerCount, &(count + 1));
+    let new_count = count.checked_add(1).expect("Signer count overflow");
+    env.storage().instance().set(&DataKey::SignerCount, &new_count);
     env.events().publish(
         (symbol_short!("multisig"), symbol_short!("sgn_add"), new_signer),
         count + 1,
+        (symbol_short!("multisig"), symbol_short!("sgn_added"), new_signer),
+        new_count,
     );
     Ok(())
 }
@@ -331,14 +334,17 @@ fn apply_remove_signer(env: &Env, signer: Address) -> Result<(), Error> {
     }
     let count: u32     = env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0);
     let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(0);
-    if count.saturating_sub(1) < threshold {
+    let new_count = count.checked_sub(1).expect("Signer count underflow");
+    if new_count < threshold {
         return Err(Error::InvalidThreshold);
     }
     env.storage().persistent().remove(&DataKey::Signer(signer.clone()));
-    env.storage().instance().set(&DataKey::SignerCount, &(count - 1));
+    env.storage().instance().set(&DataKey::SignerCount, &new_count);
     env.events().publish(
         (symbol_short!("multisig"), symbol_short!("sgn_rm"), signer),
         count - 1,
+        (symbol_short!("multisig"), symbol_short!("sgn_rmvd"), signer),
+        new_count,
     );
     Ok(())
 }

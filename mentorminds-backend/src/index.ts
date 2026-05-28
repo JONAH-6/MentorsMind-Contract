@@ -6,15 +6,20 @@ import dotenv from "dotenv";
 // Import services
 import { webSocketGateway } from "./services/websocket-gateway";
 import { horizonStreamService } from "./services/horizon-stream.service";
+import { startReconciliationJob } from "./services/horizon-stream.service";
 import { startStellarPaymentMonitoring } from "./services/stellar-stream.service";
 import { eventIndexerService } from "./services/event-indexer.service";
 import { eventIndexerRoutes } from "./routes/event-indexer.routes";
 import paymentRoutes from "./routes/payment.routes";
 import mentorWalletRoutes from "./routes/mentor-wallet.routes";
 import auditLogRoutes from "./routes/audit-log.routes";
+import quoteRoutes from "./routes/quote.routes";
+import escrowSyncRoutes from "./routes/escrow-sync.routes";
+import walletActivationRoutes from "./routes/walletActivation.routes";
 import { startNetworkMonitor, stopNetworkMonitor, getNetworkStatus } from "./services/network-monitor.service";
 import { stopStellarMonitor } from "./services/stellar-monitor.service";
 import { startRateRefresh, stopRateRefresh } from "./services/assetExchange.service";
+import { validateAssetConfigAtStartup } from "./services/asset-validation.service";
 
 // Load environment variables
 dotenv.config();
@@ -39,6 +44,9 @@ app.use("/api/events", eventIndexerRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/mentor-wallet", mentorWalletRoutes);
 app.use("/api/audit-logs", auditLogRoutes);
+app.use("/api/v1/quotes", quoteRoutes);
+app.use("/api/v1/escrow-sync", escrowSyncRoutes);
+app.use("/api/wallets", walletActivationRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -67,6 +75,9 @@ app.get("/", (req, res) => {
       payments: "/api/payments",
       mentorWallet: "/api/mentor-wallet",
       auditLogs: "/api/audit-logs",
+      quotes: "/api/v1/quotes",
+      escrowSync: "/api/v1/escrow-sync",
+      wallets: "/api/wallets",
       health: "/health",
       networkStatus: "/api/v1/network/status",
       websocket: "ws://localhost:" + PORT + "/ws/events",
@@ -133,8 +144,21 @@ httpServer.listen(PORT, () => {
   console.log("=".repeat(60));
 
   // Start Horizon streaming after server is ready
-  setTimeout(() => {
+  setTimeout(async () => {
+    // Validate asset configuration before starting services
+    try {
+      await validateAssetConfigAtStartup({
+        checkExistence: true,
+        horizonUrl: process.env.HORIZON_URL,
+      });
+    } catch (error) {
+      console.error('[Startup] Asset validation failed:', error);
+      // In production, this will throw and prevent startup
+      // In development, it will warn and continue
+    }
+
     startStellarPaymentMonitoring();
+    startReconciliationJob();
     console.log("Starting Horizon event streaming...");
     horizonStreamService.startStreaming().catch((err) => {
       console.error("[Startup] Failed to start streaming:", err);

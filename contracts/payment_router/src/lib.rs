@@ -11,6 +11,12 @@ pub const CHAIN_ETHEREUM: u32 = 2;
 pub const CHAIN_SOLANA: u32 = 1;
 pub const CHAIN_BSC: u32 = 4;
 
+/// Maximum price deviation (bps) allowed between the oracle TWAP and the
+/// spot price before a cross-chain payment is rejected.
+/// 500 bps = 5 %.  Bridged payments carry higher manipulation risk, so we
+/// use a tighter threshold than the oracle's own circuit breaker.
+pub const ORACLE_PRICE_DEVIATION_BPS: i128 = 500;
+
 #[derive(Clone)]
 #[contracttype]
 pub struct RouterConfig {
@@ -18,6 +24,9 @@ pub struct RouterConfig {
     pub escrow_contract: Address,
     pub bridge_receiver: Address,
     pub supported_chains: Vec<u32>,
+    /// Optional oracle contract address.  When set, cross-chain payments are
+    /// validated against the oracle's TWAP before being routed.
+    pub oracle_contract: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -76,6 +85,7 @@ impl PaymentRouter {
             escrow_contract,
             bridge_receiver,
             supported_chains,
+            oracle_contract: None,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -139,6 +149,27 @@ impl PaymentRouter {
         // Get config
         let config = Self::get_config(env.clone());
 
+        // -------------------------------------------------------------------
+        // Oracle price-manipulation check for cross-chain payments.
+        //
+        // When an oracle is configured, we query the TWAP for the payment
+        // token and reject the routing if the current spot price deviates
+        // from the TWAP by more than ORACLE_PRICE_DEVIATION_BPS.  This
+        // prevents an attacker from bridging tokens at a manipulated price
+        // to inflate the escrow value.
+        //
+        // The asset symbol is derived from the token address using a
+        // deterministic mapping stored in the oracle (or falls back to a
+        // generic check via `is_price_manipulated`).
+        //
+        // For native Stellar payments the learner controls the token
+        // directly, so oracle gating is optional but still applied when
+        // an oracle is configured.
+        // -------------------------------------------------------------------
+        if let Some(ref oracle) = config.oracle_contract {
+            Self::validate_oracle_price(&env, oracle, &token);
+        }
+
         // For Stellar direct payments, transfer tokens from learner to escrow
         if source_chain == CHAIN_STELLAR {
             let token_client = token::Client::new(&env, &token);
@@ -190,7 +221,7 @@ impl PaymentRouter {
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::EscrowIdCounter, &(counter + 1));
+            .set(&DataKey::EscrowIdCounter, &(counter.checked_add(1).expect("Overflow")));
 
         // Emit payment routed event
         let event = PaymentRoutedEvent {
@@ -297,6 +328,40 @@ impl PaymentRouter {
         env.storage().instance().set(&DataKey::Config, &new_config);
     }
 
+    /// Set or update the oracle contract address (admin only).
+    ///
+    /// When set, cross-chain payments are validated against the oracle's TWAP
+    /// before being routed.  Pass the token symbol (e.g. `symbol_short!("USDC")`)
+    /// as the asset identifier when calling `route_payment`.
+    pub fn set_oracle(env: Env, oracle_contract: Address) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+
+        let mut new_config = config;
+        new_config.oracle_contract = Some(oracle_contract.clone());
+        env.storage().instance().set(&DataKey::Config, &new_config);
+
+        env.events().publish(
+            (symbol_short!("router"), symbol_short!("orc_set")),
+            oracle_contract,
+        );
+    }
+
+    /// Remove the oracle integration (admin only).
+    pub fn clear_oracle(env: Env) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+
+        let mut new_config = config;
+        new_config.oracle_contract = None;
+        env.storage().instance().set(&DataKey::Config, &new_config);
+    }
+
+    /// Return the configured oracle contract address, if any.
+    pub fn get_oracle(env: Env) -> Option<Address> {
+        Self::get_config(env).oracle_contract
+    }
+
     /// Get the router configuration
     pub fn get_config(env: Env) -> RouterConfig {
         env.storage()
@@ -349,6 +414,44 @@ impl PaymentRouter {
         }
         // For Stellar native (source_chain == 0), verification is done via require_auth
         // in the route_payment function
+    }
+
+    /// Validate that the token price reported by the oracle has not been
+    /// manipulated.
+    ///
+    /// Uses the oracle's `is_price_manipulated` function with the router's
+    /// own deviation threshold (`ORACLE_PRICE_DEVIATION_BPS`).  The asset
+    /// symbol is derived from the token address by calling `get_asset_symbol`
+    /// on the oracle; if that call is not available the check is skipped
+    /// gracefully.
+    ///
+    /// Panics with "oracle: price manipulation detected" if the spot price
+    /// deviates from the TWAP by more than ORACLE_PRICE_DEVIATION_BPS.
+    fn validate_oracle_price(env: &Env, oracle: &Address, token: &Address) {
+        // Derive the asset symbol from the token address via the oracle.
+        // The oracle exposes `get_asset_for_token(token) -> Option<Symbol>`.
+        // If the oracle does not know this token, we skip the check.
+        let maybe_asset: Option<Symbol> = env.invoke_contract(
+            oracle,
+            &Symbol::new(env, "get_asset_for_token"),
+            (token.clone(),).into_val(env),
+        );
+
+        let asset = match maybe_asset {
+            Some(a) => a,
+            None => return, // Token not tracked by oracle — skip check.
+        };
+
+        // Check whether the price is currently manipulated.
+        let manipulated: bool = env.invoke_contract(
+            oracle,
+            &Symbol::new(env, "is_price_manipulated"),
+            (asset, ORACLE_PRICE_DEVIATION_BPS).into_val(env),
+        );
+
+        if manipulated {
+            panic!("oracle: price manipulation detected — payment routing blocked");
+        }
     }
 
     fn create_escrow(

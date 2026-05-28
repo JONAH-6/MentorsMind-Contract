@@ -27,7 +27,13 @@ pub enum DataKey {
     Review(Symbol),
     MentorRatingSum(Address),
     MentorReviewCount(Address),
+    LoyaltyPoints(Address),
+    LoyaltyTier(Address),
 }
+
+pub const TIER_SILVER: u32 = 100;
+pub const TIER_GOLD: u32 = 500;
+pub const TIER_PLATINUM: u32 = 1000;
 
 // ── Escrow status mirror (must match escrow contract) ────────────────────────
 #[contracttype]
@@ -188,6 +194,45 @@ impl ReputationContract {
             .get(&DataKey::Review(session_id))
             .expect("Review not found")
     }
+
+
+    pub fn calculate_average_rating(env: Env, user: Address) -> u32 {
+        let key = (symbol_short!("AvgRating"), user.clone());
+        env.storage().persistent().get(&key).unwrap_or(0u32)
+    }
+    
+    /// Accrue loyalty points for a user and update their tier (#463).
+    pub fn accrue_loyalty_points(env: Env, user: Address, points: u32) {
+        let current: u32 = env.storage().persistent().get(&DataKey::LoyaltyPoints(user.clone())).unwrap_or(0);
+        let total = current + points;
+        env.storage().persistent().set(&DataKey::LoyaltyPoints(user.clone()), &total);
+        let tier = if total >= TIER_PLATINUM { 3u32 } else if total >= TIER_GOLD { 2u32 } else if total >= TIER_SILVER { 1u32 } else { 0u32 };
+        env.storage().persistent().set(&DataKey::LoyaltyTier(user.clone()), &tier);
+        env.events().publish(("loyalty_points_accrued", user), (total, tier));
+    }
+
+    pub fn get_loyalty_points(env: Env, user: Address) -> u32 {
+        env.storage().persistent().get(&DataKey::LoyaltyPoints(user)).unwrap_or(0)
+    }
+
+    pub fn get_loyalty_tier(env: Env, user: Address) -> u32 {
+        env.storage().persistent().get(&DataKey::LoyaltyTier(user)).unwrap_or(0)
+    }
+
+    /// Returns discount in bps based on loyalty tier (0=0%, 1=5%, 2=10%, 3=15%).
+    pub fn get_loyalty_discount_bps(env: Env, user: Address) -> u32 {
+        let tier: u32 = env.storage().persistent().get(&DataKey::LoyaltyTier(user)).unwrap_or(0);
+        match tier { 1 => 500, 2 => 1000, 3 => 1500, _ => 0 }
+    }
+
+    pub fn update_reputation(env: Env, user: Address, new_rating: u32) {
+        let key = (symbol_short!("AvgRating"), user.clone());
+        let current: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
+        let updated = if current == 0 { new_rating } else { (current + new_rating) / 2 };
+        env.storage().persistent().set(&key, &updated);
+        env.events().publish((symbol_short!("Reputation"), symbol_short!("updated")), (user, updated));
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
