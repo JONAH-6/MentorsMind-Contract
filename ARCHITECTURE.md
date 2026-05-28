@@ -35,6 +35,11 @@ Supporting contracts (examples):
 - `health_dashboard`: aggregates metrics across contracts
 - `escrow_factory`: deployment/orchestration for escrow instances
 
+Yield architecture:
+- `lending_pool` acts as the dedicated yield contract for pooled liquidity operations.
+- Yield lifecycle is explicit: protocol accrues yield, then distributes lender-share LP value through yield distribution calls.
+- `interface_registry` exposes canonical `yield_v1` registration and lookup so escrow and other contracts can resolve the active yield contract address/version without hard-coding IDs.
+
 Design rule:
 - Cross-contract consumers mirror escrow struct/status fields for decode stability.
 
