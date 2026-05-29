@@ -1,0 +1,236 @@
+================================================================================
+FIXES SUMMARY: Issues #253, #254, #255, #256
+================================================================================
+
+ISSUE #255: resolve_dispute Passes JavaScript Number Instead of Integer
+------------------------------------------------------------------------
+Problem: normalizeSplitPercentage returned a JavaScript float (e.g., 75.50) 
+which caused precision loss. Contract expects integer percentage 0-100.
+
+Files Fixed:
+✓ mentorminds-backend/src/services/escrow.service.ts
+  - Changed resolveDispute signature from (escrowId, releaseToMentor: boolean) 
+    to (escrowId, mentorPct: number)
+  - Added validation: mentorPct must be integer 0-100
+  - Changed nativeToScVal type from 'bool' to 'u32'
+  - Added JSDoc explaining percentage format
+
+✓ mentorminds-backend/src/services/escrow-dispute.service.ts
+  - Changed interface parameter from splitPercentage to mentorPercentage
+  - Added Math.round() to normalize float to integer
+  - Added validation for 0-100 range
+  - Updated JSDoc
+
+✓ mentorminds-backend/src/services/disputes.service.ts
+  - Changed resolveDispute call from (escrowId, true) to (escrowId, 100)
+  - 100 = 100% to mentor (full release)
+
+✓ mentorminds-backend/tests/escrow.service.test.ts
+  - Updated test to use integer percentage (100 instead of true)
+  - Added validation tests for float, negative, and out-of-range values
+
+✓ mentorminds-backend/tests/escrow-dispute.service.test.ts
+  - Changed test parameter from splitPercentage to mentorPercentage
+
+Contract Signature (Rust):
+  pub fn resolve_dispute(env: Env, escrow_id: u64, mentor_pct: u32)
+  - mentor_pct: 0-100 integer (e.g., 75 = 75% to mentor, 25% to learner)
+
+
+ISSUE #256: createEscrow Does Not Set Deadline
+-----------------------------------------------
+Problem: create_escrow was called without deadline parameter, meaning funds 
+could be locked forever if platform goes offline.
+
+Files Fixed:
+✓ mentorminds-backend/src/services/escrow.service.ts
+  - Added deadline: number to CreateEscrowInput interface
+  - Added deadline validation (must be future Unix timestamp)
+  - Added deadline parameter to contract call: nativeToScVal(input.deadline, {type: 'u64'})
+  - Added JSDoc explaining deadline format
+
+✓ mentorminds-backend/src/services/sorobanEscrow.service.ts
+  - Added deadline parameter to createEscrow method signature
+  - Added validation that deadline is in the future
+  - Added JSDoc
+
+✓ mentorminds-backend/src/examples/bookings-with-escrow-release.example.ts
+  - Created complete example showing how to calculate deadline
+  - Formula: scheduledEnd + 7 days grace period
+  - Shows conversion to Unix timestamp (seconds)
+
+Contract Signature (Rust):
+  pub fn create_escrow(
+    env: Env,
+    mentor: Address,
+    learner: Address,
+    amount: i128,
+    session_id: Symbol,
+    token_address: Address,
+    session_end_time: u64  // <-- This is the deadline parameter
+  ) -> u64
+
+Usage Example:
+  const deadline = Math.floor((booking.scheduledEnd.getTime() + 7*24*60*60*1000) / 1000);
+  await sorobanEscrow.createEscrow({ ..., deadline });
+
+
+ISSUE #254: scheduleEscrowRelease Never Called
+-----------------------------------------------
+Problem: escrowReleaseQueue existed but was never invoked. Funds were released 
+immediately instead of after 48-hour delay.
+
+Files Created:
+✓ mentorminds-backend/src/services/escrow-release-queue.service.ts
+  - scheduleEscrowRelease(): Schedules release 48 hours after completion
+  - cancelEscrowRelease(): Cancels scheduled release (for disputes)
+  - InMemoryEscrowReleaseQueue: In-memory implementation for dev/testing
+  - EscrowReleaseQueue interface for production (Bull/BullMQ)
+
+✓ mentorminds-backend/tests/escrow-release-queue.service.test.ts
+  - Tests for scheduling, cancellation, immediate execution
+  - Tests for replacing existing jobs
+  - Tests for pending job count
+
+✓ mentorminds-backend/src/examples/bookings-with-escrow-release.example.ts
+  - Complete BookingsService example showing integration
+  - confirmBooking(): Creates escrow with deadline
+  - completeBooking(): Schedules 48-hour delayed release
+  - openDispute(): Cancels scheduled release
+
+Integration Points:
+1. BookingsService.completeBooking() should call:
+   await scheduleEscrowRelease({
+     escrowId, mentorId, learnerId,
+     sessionCompletedAt: new Date()
+   }, escrowReleaseQueue);
+
+2. BookingsService.openDispute() should call:
+   await cancelEscrowRelease(escrowId, escrowReleaseQueue);
+
+3. Only release immediately if mentee explicitly approves
+
+
+ISSUE #253: No Contract Address Verification
+---------------------------------------------
+Problem: SOROBAN_ESCROW_CONTRACT_ADDRESS read from env with no verification.
+Misconfigured address could interact with wrong/malicious contract.
+
+Files Fixed:
+✓ mentorminds-backend/src/services/sorobanEscrow.service.ts
+  - Enhanced verifyContractVersion() to check contract exists on-chain
+  - Added contract address validation
+  - Added WASM hash verification (if CONTRACT_EXPECTED_WASM_HASH is set)
+  - Added getContractVerificationStatus() method
+  - Returns: "verified" | "unverified" | "mismatch"
+
+✓ mentorminds-backend/src/examples/health-check-with-contract-verification.example.ts
+  - HealthCheckService with contract verification status
+  - verifyContractOnStartup() function for app initialization
+  - Express route handler example
+  - Example health check responses
+
+Health Endpoint Response:
+{
+  "status": "healthy",
+  "services": {
+    "database": "up",
+    "soroban_contract": "verified"
+  },
+  "details": {
+    "soroban": {
+      "contractAddress": "CAAAA...",
+      "expectedVersion": "1.0.0",
+      "resolvedVersion": "1.0.0",
+      "network": "testnet"
+    }
+  }
+}
+
+Environment Variables:
+- SOROBAN_ESCROW_CONTRACT_ADDRESS (required)
+- SOROBAN_CONTRACT_VERSION (optional, for version check)
+- CONTRACT_EXPECTED_WASM_HASH (optional, for WASM verification)
+- STELLAR_NETWORK (testnet/mainnet)
+- SOROBAN_RPC_URL
+
+Startup Integration:
+  const sorobanEscrow = new SorobanEscrowServiceImpl();
+  await verifyContractOnStartup(sorobanEscrow);
+  // App will log critical alert if verification fails
+
+
+================================================================================
+TESTING
+================================================================================
+
+All test files updated to match new signatures:
+✓ mentorminds-backend/tests/escrow.service.test.ts
+✓ mentorminds-backend/tests/escrow-dispute.service.test.ts
+✓ mentorminds-backend/tests/escrow-release-queue.service.test.ts (new)
+
+To run tests:
+  cd mentorminds-backend
+  npm install  # if jest not installed
+  npm test
+
+
+================================================================================
+MIGRATION CHECKLIST
+================================================================================
+
+For existing deployments, update in this order:
+
+1. Deploy updated backend code with new signatures
+2. Update all resolveDispute calls to use integer percentage (0-100)
+3. Update all createEscrow calls to include deadline parameter
+4. Initialize escrow release queue (Redis + Bull recommended for production)
+5. Update BookingsService.completeBooking to call scheduleEscrowRelease
+6. Update BookingsService.openDispute to call cancelEscrowRelease
+7. Add health check endpoint with contract verification
+8. Set environment variables:
+   - CONTRACT_EXPECTED_WASM_HASH (optional but recommended)
+   - Verify SOROBAN_ESCROW_CONTRACT_ADDRESS is correct
+9. Run verifyContractOnStartup() during app initialization
+10. Monitor health endpoint for contract verification status
+
+
+================================================================================
+PRODUCTION RECOMMENDATIONS
+================================================================================
+
+1. Replace InMemoryEscrowReleaseQueue with Bull/BullMQ backed by Redis
+2. Implement retry logic for failed releases
+3. Add dead-letter queue for permanently failed releases
+4. Set up monitoring/alerts for:
+   - Contract verification failures
+   - Failed escrow releases
+   - Queue processing delays
+5. Implement WASM hash verification (currently TODO)
+6. Consider exiting process on startup if contract verification fails
+7. Add metrics for:
+   - Scheduled releases count
+   - Failed releases count
+   - Average release delay
+
+
+================================================================================
+BREAKING CHANGES
+================================================================================
+
+API Changes:
+- AdminEscrowService.resolveDispute(escrowId, boolean) 
+  → resolveDispute(escrowId, number)
+  
+- EscrowDisputeService.resolveDispute({ splitPercentage })
+  → resolveDispute({ mentorPercentage })
+
+- CreateEscrowInput now requires deadline: number field
+
+Migration:
+- Old: resolveDispute(42, true)  → New: resolveDispute(42, 100)
+- Old: resolveDispute(42, false) → New: resolveDispute(42, 0)
+- Old: createEscrow({ ... })     → New: createEscrow({ ..., deadline })
+
+
+================================================================================

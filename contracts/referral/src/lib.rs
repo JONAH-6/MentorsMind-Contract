@@ -1,8 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +35,7 @@ pub struct RewardClaimedEventData {
 pub enum DataKey {
     Admin,
     MNTToken,
+    LeaderboardContract,
     Referral(Address), // referee -> ReferralInfo
     ReferrerCount(Address),
     PendingReward(Address), // referrer -> amount
@@ -50,7 +49,7 @@ pub struct ReferralContract;
 
 #[contractimpl]
 impl ReferralContract {
-    pub fn initialize(env: Env, admin: Address, mnt_token: Address) {
+    pub fn initialize(env: Env, admin: Address, mnt_token: Address, leaderboard: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
@@ -58,6 +57,9 @@ impl ReferralContract {
         env.storage()
             .persistent()
             .set(&DataKey::MNTToken, &mnt_token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LeaderboardContract, &leaderboard);
     }
 
     pub fn register_referral(env: Env, referrer: Address, referee: Address, is_mentor: bool) {
@@ -151,6 +153,19 @@ impl ReferralContract {
         env.storage()
             .persistent()
             .set(&DataKey::PendingReward(info.referrer), &pending);
+
+        // Update leaderboard
+        let leaderboard: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LeaderboardContract)
+            .expect("Leaderboard not set");
+        let count = Self::get_referral_count(env, info.referrer.clone());
+        env.invoke_contract::<()>(
+            &leaderboard,
+            &Symbol::new(&env, "record_referral"),
+            (info.referrer, count).into_val(&env),
+        );
     }
 
     pub fn claim_reward(env: Env, referrer: Address) {
@@ -165,15 +180,31 @@ impl ReferralContract {
             panic!("No rewards to claim");
         }
 
+        let leaderboard: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LeaderboardContract)
+            .expect("Leaderboard not set");
+        let multiplier: u32 = env.invoke_contract(
+            &leaderboard,
+            &Symbol::new(&env, "get_multiplier"),
+            (referrer.clone(),).into_val(&env),
+        );
+
+        let actual_amount = (pending * multiplier as i128) / 10000;
+
         let mnt_token: Address = env
             .storage()
             .persistent()
             .get(&DataKey::MNTToken)
             .expect("Token not set");
 
-        // Call MNT Token to mint rewards.
-        let client = mentorminds_mnt_token::MNTTokenClient::new(&env, &mnt_token);
-        client.mint(&referrer, &pending);
+        // Mint the actual amount
+        env.invoke_contract::<()>(
+            &mnt_token,
+            &Symbol::new(&env, "mint"),
+            (referrer.clone(), actual_amount).into_val(&env),
+        );
 
         env.storage()
             .persistent()
@@ -185,7 +216,7 @@ impl ReferralContract {
                 Symbol::new(&env, "RewardClaimed"),
                 referrer.clone(),
             ),
-            RewardClaimedEventData { amount: pending },
+            RewardClaimedEventData { amount: actual_amount },
         );
     }
 
@@ -209,6 +240,55 @@ impl ReferralContract {
             .get(&DataKey::Admin)
             .expect("Not initialized")
     }
+
+    /// Distribute a portion of platform fees as referral rewards.
+    /// `reward_bps` basis points of `platform_fee` are added to the referrer's
+    /// pending rewards. Admin only.
+    pub fn distribute_from_fee(
+        env: Env,
+        referrer: Address,
+        platform_fee: i128,
+        reward_bps: u32,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if platform_fee <= 0 || reward_bps == 0 {
+            return;
+        }
+
+        let reward = platform_fee
+            .checked_mul(reward_bps as i128)
+            .expect("overflow")
+            / 10_000;
+
+        if reward <= 0 {
+            return;
+        }
+
+        let mut pending: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingReward(referrer.clone()))
+            .unwrap_or(0);
+        pending = pending.checked_add(reward).expect("overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingReward(referrer.clone()), &pending);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "Referral"),
+                Symbol::new(&env, "FeeReward"),
+                referrer,
+            ),
+            (reward,),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -216,14 +296,15 @@ mod test {
     extern crate std;
     use super::*;
     use mentorminds_mnt_token::{MNTToken, MNTTokenClient};
-    use soroban_sdk::testutils::Address as _;
+    use mentorminds_referral_leaderboard::{ReferralLeaderboardContract, ReferralLeaderboardContractClient};
     use soroban_sdk::testutils::{Address as _, Events};
-    use soroban_sdk::{IntoVal, Symbol};
+    use soroban_sdk::{IntoVal, Symbol, TryFromVal};
 
     struct TestFixture {
         env: Env,
         mnt_id: Address,
         ref_id: Address,
+        leaderboard_id: Address,
         admin: Address,
     }
 
@@ -234,19 +315,24 @@ mod test {
 
             let admin = Address::generate(&env);
             let mnt_id = env.register_contract(None, MNTToken);
+            let leaderboard_id = env.register_contract(None, ReferralLeaderboardContract);
             let ref_id = env.register_contract(None, ReferralContract);
 
             let mnt_client = MNTTokenClient::new(&env, &mnt_id);
             // Make the referral contract the admin of the MNT token so it can mint!
             mnt_client.initialize(&ref_id);
 
+            let leaderboard_client = ReferralLeaderboardContractClient::new(&env, &leaderboard_id);
+            leaderboard_client.initialize(&ref_id);
+
             let ref_client = ReferralContractClient::new(&env, &ref_id);
-            ref_client.initialize(&admin, &mnt_id);
+            ref_client.initialize(&admin, &mnt_id, &leaderboard_id);
 
             TestFixture {
                 env,
                 mnt_id,
                 ref_id,
+                leaderboard_id,
                 admin,
             }
         }
@@ -289,13 +375,14 @@ mod test {
             )
                 .into_val(&f.env)
         );
+        let payload = ReferralRegisteredEventData::try_from_val(&f.env, &last_event.2)
+            .expect("registered payload should decode");
         assert_eq!(
-            last_event.2,
+            payload,
             ReferralRegisteredEventData {
                 referee: referee.clone(),
-                is_mentor: true
+                is_mentor: true,
             }
-            .into_val(&f.env)
         );
 
         // Fulfill referral as admin
@@ -305,7 +392,8 @@ mod test {
         // Claim reward as referrer
         f.client().claim_reward(&referrer);
         assert_eq!(f.client().get_pending_rewards(&referrer), 0);
-        assert_eq!(f.mnt_client().balance(&referrer), REWARD_MENTOR);
+        // With multiplier 2x for rank 1
+        assert_eq!(f.mnt_client().balance(&referrer), REWARD_MENTOR * 2);
 
         let events2 = f.env.events().all();
         let last_event2 = events2.last().unwrap();
@@ -319,12 +407,13 @@ mod test {
             )
                 .into_val(&f.env)
         );
+        let payload2 = RewardClaimedEventData::try_from_val(&f.env, &last_event2.2)
+            .expect("reward payload should decode");
         assert_eq!(
-            last_event2.2,
+            payload2,
             RewardClaimedEventData {
-                amount: REWARD_MENTOR
+                amount: REWARD_MENTOR * 2,
             }
-            .into_val(&f.env)
         );
     }
 

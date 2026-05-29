@@ -1,4 +1,4 @@
-export type PaymentStatus = 'pending' | 'confirmed' | 'failed' | 'timeout';
+export type PaymentStatus = 'pending' | 'confirmed' | 'failed' | 'timeout' | 'underpaid';
 
 export interface Payment {
   id: string;
@@ -33,4 +33,11 @@ export interface HorizonWebhookPayload {
   ledger: number;
   successful: boolean;
   result_code?: string;
+}
+
+export interface ExchangeRate {
+  baseAsset: string;
+  counterAsset: string;
+  rate: number;
+  lastUpdated: Date;
 }
