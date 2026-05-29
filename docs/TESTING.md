@@ -65,3 +65,38 @@ To run the token approval tests, invoke the standard `cargo test` command in the
 ```bash
 cargo test --package mentorminds-integration-tests --test integration_test token_approval::
 ```
+
+---
+
+# Partial Release Testing
+
+This section outlines the testing scenarios for multi-session partial release logic in the `escrow` contract. Partial releases allow mentors to withdraw funds incrementally upon the completion of individual sessions within a multi-session engagement, without waiting for the entire package to conclude.
+
+## Overview
+
+When an escrow is created for a bundle of sessions (`total_sessions > 1`), funds are initially locked. `release_partial` calculates the proportionate share for a single session, deducts the applicable platform fee, and transfers the net amount to the mentor. The final session triggers a state transition on the escrow to `Released`.
+
+## Test Cases Covered
+
+The `tests/partial_release/mod.rs` integration test suite validates the following multi-session scenarios:
+
+### 1. Partial Release for 2-Session Escrow
+Verifies the math and state transitions for a simple 2-session bundle. The first release correctly transfers 50% of the principal and fees, incrementing `sessions_completed`. The second release transfers the remainder and correctly finalizes the escrow status to `Released`.
+
+### 2. Partial Release for 5-Session Escrow
+Validates sequential iterative releases over a larger `total_sessions` scale. Checks that iterating `release_partial` correctly loops until completion without panic or state corruption.
+
+### 3. Partial Release for 10-Session Escrow
+Ensures the integer math safely computes fractional divisions correctly without losing precision or locking residual dust in the contract for a 10-session package. 
+
+### 4. Sequential Partial Releases & State Finality
+Validates that calling `release_partial` after the maximum number of sessions have been completed results in an appropriate failure (`Completed`). Ensures double-releases are mechanically impossible.
+
+### 5. Partial Release with Disputes
+Tests the intersection of partial releases and the dispute resolution state machine. For example, verifying a scenario where session 1 completes successfully (mentor gets paid) but session 2 falls into dispute. It validates that the correct unreleased remainder is successfully refunded to the learner without interfering with the funds already released.
+
+## Execution
+To run the partial release tests, invoke the standard `cargo test` command in the `MentorsMind-Contract` root directory:
+```bash
+cargo test --package mentorminds-integration-tests --test integration_test partial_release::
+```
