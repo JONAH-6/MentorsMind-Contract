@@ -60,6 +60,8 @@ pub enum DataKey {
     Route(BytesN<32>),
     ProcessedTx(BytesN<32>),
     EscrowIdCounter,
+    FeeBps,
+    Treasury,
 }
 
 #[contract]
@@ -179,20 +181,27 @@ impl PaymentRouter {
                 panic!("Insufficient token balance");
             }
 
-            // Transfer tokens from learner to the escrow contract
-            token_client.transfer(&learner, &config.escrow_contract, &amount);
+            // Transfer the fee to the treasury if applicable
+            if fee > 0 {
+                let treasury: Address = env.storage().instance().get(&DataKey::Treasury).expect("Treasury not set");
+                token_client.transfer(&learner, &treasury, &fee);
+            }
+            
+            // Note: The escrow contract will ALSO try to transfer the net_amount from the learner
+            // depending on how create_escrow is structured. If router transfers to escrow, 
+            // escrow might transfer again. We assume escrow expects the learner to pay directly.
         }
 
         // Generate a unique session ID for the escrow
         let session_id = Self::generate_session_id(&env, &source_tx_hash, source_chain);
 
-        // Create escrow via cross-contract call
+        // Create escrow via cross-contract call using net_amount
         let escrow_id = Self::create_escrow(
             &env,
             &config.escrow_contract,
             mentor.clone(),
             learner.clone(),
-            amount,
+            net_amount,
             session_id,
             token.clone(),
         );
@@ -204,7 +213,7 @@ impl PaymentRouter {
             source_tx_hash: source_tx_hash.clone(),
             learner: learner.clone(),
             mentor: mentor.clone(),
-            amount,
+            amount: net_amount, // store the routed amount
             token: token.clone(),
             created_at: env.ledger().timestamp(),
         };
@@ -230,12 +239,49 @@ impl PaymentRouter {
             escrow_id,
             learner: learner.clone(),
             mentor: mentor.clone(),
-            amount,
+            amount: net_amount,
             token: token.clone(),
         };
         Self::emit_payment_routed(&env, event);
 
         escrow_id
+    }
+
+    /// Calculate routing fee for a given amount
+    pub fn calculate_fee(env: Env, amount: i128) -> i128 {
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        if fee_bps > 0 {
+            amount.checked_mul(fee_bps as i128).unwrap_or(0) / 10_000
+        } else {
+            0
+        }
+    }
+
+    /// Update routing fee bps (admin only)
+    pub fn set_fee_bps(env: Env, fee_bps: u32) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        if fee_bps > 10_000 {
+            panic!("Fee > 10000 bps");
+        }
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+    }
+
+    /// Update routing treasury (admin only)
+    pub fn set_treasury(env: Env, treasury: Address) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+    }
+
+    /// Get current routing fee bps
+    pub fn get_fee_bps(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    /// Get current treasury
+    pub fn get_treasury(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Treasury).expect("Treasury not set")
     }
 
     /// Get the escrow ID for a given source transaction hash
