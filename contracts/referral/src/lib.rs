@@ -261,10 +261,13 @@ impl ReferralContract {
             return;
         }
 
+        // Multiply first to preserve precision, then divide — matching the
+        // escrow fee formula so referral rewards are computed consistently.
         let reward = platform_fee
             .checked_mul(reward_bps as i128)
             .expect("overflow")
-            / 10_000;
+            .checked_div(10_000)
+            .expect("division error");
 
         if reward <= 0 {
             return;
