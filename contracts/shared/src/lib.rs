@@ -21,18 +21,32 @@ pub use state_machine::StateMachine;
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 
+/// Common error codes shared across all MentorsMind contracts.
+///
+/// Contracts may re-export or extend this enum; the numeric codes are stable
+/// and used in off-chain tooling to distinguish error categories.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum SharedError {
+    /// `initialize` was called more than once on the contract.
     AlreadyInitialized = 1,
+    /// A function requiring initialization was called before `initialize`.
     NotInitialized = 2,
+    /// The caller lacks the required role (admin, mentor, learner, etc.).
     Unauthorized = 3,
+    /// The requested record (escrow, user, token, etc.) does not exist.
     NotFound = 4,
+    /// The supplied amount is zero, negative, or exceeds an allowed range.
     InvalidAmount = 5,
+    /// The operation is not valid for the entity's current state.
     InvalidState = 6,
+    /// An attempt was made to insert a record that already exists.
     DuplicateEntry = 7,
+    /// The operation is not supported in the current contract configuration.
     UnsupportedOperation = 8,
+    /// An arithmetic operation would overflow the integer bounds.
     Overflow = 9,
+    /// An arithmetic operation would underflow below zero.
     Underflow = 10,
 }
