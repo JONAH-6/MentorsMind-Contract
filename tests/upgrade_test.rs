@@ -337,7 +337,7 @@ fn test_upgrade_path_preserves_storage_and_enables_new_features() {
     let reinit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let other = Address::generate(&env);
         let empty: Vec<Address> = Vec::new(&env);
-        v2.initialize(&other, &treasury, &500u32, &empty, &0u64);
+        v2.initialize(&other, &treasury, &500u32, &empty, &0u64, &None);
     }));
     assert!(reinit.is_err());
 }

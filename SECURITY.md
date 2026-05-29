@@ -261,6 +261,38 @@ Maximum delay: 90 days from initial report
 
 ---
 
+## Formal Audit Readiness
+
+This section captures the repository-side preparation work needed before a third-party audit engagement begins. It is intended to make external review faster, more repeatable, and easier to scope.
+
+### Current Readiness Package
+
+- documented threat model in `docs/threat-model.md`
+- trust assumptions in `docs/trust-assumptions.md`
+- attack simulation notes in `docs/attack-simulations.md`
+- audit preparation checklist in `docs/security-audit-checklist.md`
+- storage and state-machine references in `docs/storage-guide.md` and `docs/state-machines.md`
+
+### Required Pre-Engagement Checklist
+
+- freeze the audit target commit or release tag before sharing artifacts
+- publish the in-scope contract list and deployment assumptions
+- attach known limitations, privileged roles, and upgrade paths
+- include integration and upgrade tests that preserve critical state
+- record every post-audit fix in a remediation table before requesting sign-off
+
+### Engagement Output Requirements
+
+- severity-ranked findings with reproduction notes
+- explicit confirmation of reviewed contracts and commit hashes
+- remediation tracking for every critical, high, and medium issue
+- a public summary that links fixes back to the audit report
+
+### Post-Audit Policy
+
+- no major feature merges should land between audit sign-off and production release without re-review
+- any change to authorization, fund movement, upgrade flows, or oracle assumptions should trigger an incremental audit review
+- follow-up fixes should reference the original audit finding identifiers in their pull requests
 ## 🔐 Security Best Practices for Researchers
 
 ### Testing Guidelines
