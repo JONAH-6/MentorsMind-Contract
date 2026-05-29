@@ -53,6 +53,13 @@ pub struct PaymentRoutedEvent {
     pub token: Address,
 }
 
+/// Event data emitted when a token is approved or rejected in the router.
+#[contracttype]
+pub struct RouterTokenApprovalEvent {
+    pub token: Address,
+    pub approved: bool,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -60,6 +67,8 @@ pub enum DataKey {
     Route(BytesN<32>),
     ProcessedTx(BytesN<32>),
     EscrowIdCounter,
+    /// Token whitelist: DataKey::ApprovedToken(token_address) → bool
+    ApprovedToken(Address),
 }
 
 #[contract]
@@ -98,6 +107,57 @@ impl PaymentRouter {
             .publish((symbol_short!("router"), symbol_short!("init")), admin);
     }
 
+    // -----------------------------------------------------------------------
+    // Token Whitelist Management (admin only)
+    // -----------------------------------------------------------------------
+
+    /// Add or remove an approved token from the router whitelist (admin only).
+    /// Only whitelisted tokens can be routed through the payment router.
+    pub fn set_approved_token(env: Env, token_address: Address, approved: bool) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+
+        let key = DataKey::ApprovedToken(token_address.clone());
+        env.storage().persistent().set(&key, &approved);
+
+        // Emit token approval/rejection event
+        if approved {
+            env.events().publish(
+                (symbol_short!("router"), symbol_short!("tok_appr")),
+                RouterTokenApprovalEvent {
+                    token: token_address,
+                    approved: true,
+                },
+            );
+        } else {
+            env.events().publish(
+                (symbol_short!("router"), symbol_short!("tok_rej")),
+                RouterTokenApprovalEvent {
+                    token: token_address,
+                    approved: false,
+                },
+            );
+        }
+    }
+
+    /// Check if a token is on the router's approved whitelist.
+    pub fn is_token_approved(env: Env, token_address: Address) -> bool {
+        Self::_is_token_approved(&env, &token_address)
+    }
+
+    /// Internal token whitelist check.
+    fn _is_token_approved(env: &Env, token_address: &Address) -> bool {
+        let key = DataKey::ApprovedToken(token_address.clone());
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&key)
+            .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Payment Routing
+    // -----------------------------------------------------------------------
+
     /// Route a payment from any supported chain to create an escrow
     ///
     /// # Arguments
@@ -106,7 +166,7 @@ impl PaymentRouter {
     /// * `learner` - The learner's address
     /// * `mentor` - The mentor's address  
     /// * `amount` - The payment amount
-    /// * `token` - The token contract address
+    /// * `token` - The token contract address (must be whitelisted)
     ///
     /// # Returns
     /// * The escrow ID created
@@ -119,6 +179,14 @@ impl PaymentRouter {
         amount: i128,
         token: Address,
     ) -> u64 {
+        // *** STRICT TOKEN WHITELIST VALIDATION ***
+        // The token MUST be on the router's approved list before routing.
+        // This prevents malicious token contracts from being used to
+        // circumvent restrictions in the escrow contract.
+        if !Self::_is_token_approved(&env, &token) {
+            panic!("Token not approved for routing");
+        }
+
         // Verify the source transaction
         Self::verify_source_transaction(
             &env,
@@ -149,23 +217,7 @@ impl PaymentRouter {
         // Get config
         let config = Self::get_config(env.clone());
 
-        // -------------------------------------------------------------------
         // Oracle price-manipulation check for cross-chain payments.
-        //
-        // When an oracle is configured, we query the TWAP for the payment
-        // token and reject the routing if the current spot price deviates
-        // from the TWAP by more than ORACLE_PRICE_DEVIATION_BPS.  This
-        // prevents an attacker from bridging tokens at a manipulated price
-        // to inflate the escrow value.
-        //
-        // The asset symbol is derived from the token address using a
-        // deterministic mapping stored in the oracle (or falls back to a
-        // generic check via `is_price_manipulated`).
-        //
-        // For native Stellar payments the learner controls the token
-        // directly, so oracle gating is optional but still applied when
-        // an oracle is configured.
-        // -------------------------------------------------------------------
         if let Some(ref oracle) = config.oracle_contract {
             Self::validate_oracle_price(&env, oracle, &token);
         }
@@ -329,10 +381,6 @@ impl PaymentRouter {
     }
 
     /// Set or update the oracle contract address (admin only).
-    ///
-    /// When set, cross-chain payments are validated against the oracle's TWAP
-    /// before being routed.  Pass the token symbol (e.g. `symbol_short!("USDC")`)
-    /// as the asset identifier when calling `route_payment`.
     pub fn set_oracle(env: Env, oracle_contract: Address) {
         let config = Self::get_config(env.clone());
         config.admin.require_auth();
@@ -412,25 +460,11 @@ impl PaymentRouter {
                 panic!("Bridge transaction not verified");
             }
         }
-        // For Stellar native (source_chain == 0), verification is done via require_auth
-        // in the route_payment function
     }
 
     /// Validate that the token price reported by the oracle has not been
     /// manipulated.
-    ///
-    /// Uses the oracle's `is_price_manipulated` function with the router's
-    /// own deviation threshold (`ORACLE_PRICE_DEVIATION_BPS`).  The asset
-    /// symbol is derived from the token address by calling `get_asset_symbol`
-    /// on the oracle; if that call is not available the check is skipped
-    /// gracefully.
-    ///
-    /// Panics with "oracle: price manipulation detected" if the spot price
-    /// deviates from the TWAP by more than ORACLE_PRICE_DEVIATION_BPS.
     fn validate_oracle_price(env: &Env, oracle: &Address, token: &Address) {
-        // Derive the asset symbol from the token address via the oracle.
-        // The oracle exposes `get_asset_for_token(token) -> Option<Symbol>`.
-        // If the oracle does not know this token, we skip the check.
         let maybe_asset: Option<Symbol> = env.invoke_contract(
             oracle,
             &Symbol::new(env, "get_asset_for_token"),
@@ -442,7 +476,6 @@ impl PaymentRouter {
             None => return, // Token not tracked by oracle — skip check.
         };
 
-        // Check whether the price is currently manipulated.
         let manipulated: bool = env.invoke_contract(
             oracle,
             &Symbol::new(env, "is_price_manipulated"),
@@ -487,17 +520,12 @@ impl PaymentRouter {
     }
 
     fn generate_session_id(env: &Env, _source_tx_hash: &BytesN<32>, _source_chain: u32) -> Symbol {
-        // Generate a unique session ID using counter
-        // The escrow contract will enforce uniqueness via SESSION_KEY
         let counter: u64 = env
             .storage()
             .instance()
             .get(&DataKey::EscrowIdCounter)
             .unwrap_or(0);
 
-        // Use a simple scheme: alternate between known unique symbols based on counter
-        // Since the escrow contract tracks session_id uniqueness, we can cycle through
-        // a set of base symbols and rely on the contract's internal counter for true uniqueness
         match counter % 4 {
             0 => Symbol::new(env, "ROUTER_PAY_A"),
             1 => Symbol::new(env, "ROUTER_PAY_B"),
@@ -523,8 +551,6 @@ mod test {
     // Mock Bridge Receiver Contract
     // =========================================================================
 
-    /// Mock bridge receiver that simulates the real bridge receiver contract
-    /// for testing cross-chain payment routing
     #[contract]
     pub struct MockBridgeReceiver;
 
@@ -536,14 +562,12 @@ mod test {
 
     #[contractimpl]
     impl MockBridgeReceiver {
-        /// Mark a VAA as processed (for test setup)
         pub fn set_vaa_processed(env: Env, vaa_hash: BytesN<32>) {
             env.storage()
                 .instance()
                 .set(&MockBridgeKey::ProcessedVAA(vaa_hash), &true);
         }
 
-        /// Check if a VAA has been processed
         pub fn is_vaa_processed(env: Env, vaa_hash: BytesN<32>) -> bool {
             env.storage()
                 .instance()
@@ -555,7 +579,6 @@ mod test {
     // Mock Escrow Contract
     // =========================================================================
 
-    /// Mock escrow contract that simulates escrow creation
     #[contract]
     pub struct MockEscrow;
 
@@ -569,18 +592,16 @@ mod test {
 
     #[contractimpl]
     impl MockEscrow {
-        /// Create an escrow (simplified mock implementation)
         pub fn create_escrow(
             env: Env,
-            mentor: Address,
-            learner: Address,
-            amount: i128,
-            session_id: Symbol,
-            token_address: Address,
-            session_end_time: u64,
-            total_sessions: u32,
+            _mentor: Address,
+            _learner: Address,
+            _amount: i128,
+            _session_id: Symbol,
+            _token_address: Address,
+            _session_end_time: u64,
+            _total_sessions: u32,
         ) -> u64 {
-            // Simplified: just increment counter and return ID
             let mut count: u64 = env
                 .storage()
                 .instance()
@@ -605,7 +626,6 @@ mod test {
     // Mock Token Contract
     // =========================================================================
 
-    /// Mock token contract for testing Stellar direct payments
     #[contract]
     pub struct MockToken;
 
@@ -697,14 +717,19 @@ mod test {
             let router_client = PaymentRouterClient::new(&env, &router_id);
             router_client.init(&admin, &escrow_id, &bridge_id);
 
-            IntegrationFixture {
+            // *** Approve the mock token in the router's whitelist ***
+            router_client.set_approved_token(&token_id, &true);
+
+            let fixture = IntegrationFixture {
                 env,
                 router_client,
                 bridge_client: MockBridgeReceiverClient::new(&env, &bridge_id),
                 escrow_client: MockEscrowClient::new(&env, &escrow_id),
                 token_client: MockTokenClient::new(&env, &token_id),
                 admin,
-            }
+            };
+
+            fixture
         }
 
         fn fund_learner(&self, learner: &Address, amount: i128) {
@@ -715,6 +740,10 @@ mod test {
             self.bridge_client.set_vaa_processed(vaa_hash);
         }
     }
+
+    // =========================================================================
+    // Basic tests
+    // =========================================================================
 
     #[test]
     fn test_init() {
@@ -815,8 +844,11 @@ mod test {
         let (admin, escrow_contract, bridge_receiver, token, client) = setup_env(&env);
         let learner = Address::generate(&env);
         let mentor = Address::generate(&env);
+        env.mock_all_auths();
 
         client.init(&admin, &escrow_contract, &bridge_receiver);
+        // Approve the token so it's not rejected for that reason
+        client.set_approved_token(&token, &true);
 
         let tx_hash = BytesN::from_array(&env, &[1u8; 32]);
 
@@ -831,8 +863,10 @@ mod test {
         let (admin, escrow_contract, bridge_receiver, token, client) = setup_env(&env);
         let learner = Address::generate(&env);
         let mentor = Address::generate(&env);
+        env.mock_all_auths();
 
         client.init(&admin, &escrow_contract, &bridge_receiver);
+        client.set_approved_token(&token, &true);
 
         let tx_hash = BytesN::from_array(&env, &[1u8; 32]);
 
@@ -879,24 +913,105 @@ mod test {
     }
 
     // =========================================================================
-    // STELLAR DIRECT PAYMENT TEST
+    // Token Whitelist Tests
     // =========================================================================
 
-    /// Test routing a direct Stellar payment (source_chain = 0)
-    /// This verifies that native Stellar payments are properly routed to escrow
+    #[test]
+    fn test_token_whitelist_toggle() {
+        let env = Env::default();
+        let (admin, escrow_contract, bridge_receiver, _, client) = setup_env(&env);
+        env.mock_all_auths();
+        client.init(&admin, &escrow_contract, &bridge_receiver);
+
+        let token = Address::generate(&env);
+        assert!(!client.is_token_approved(&token));
+        client.set_approved_token(&token, &true);
+        assert!(client.is_token_approved(&token));
+        client.set_approved_token(&token, &false);
+        assert!(!client.is_token_approved(&token));
+    }
+
+    /// Test: Unapproved token is rejected by route_payment
+    #[test]
+    #[should_panic(expected = "Token not approved for routing")]
+    fn test_route_payment_unapproved_token() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Create a token that is NOT approved
+        let malicious_token = Address::generate(&fixture.env);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[1u8; 32]);
+        fixture.fund_learner(&learner, 1000);
+
+        // This should panic because malicious_token is not whitelisted
+        fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &1000,
+            &malicious_token,
+        );
+    }
+
+    /// Test: Revoked token is rejected by route_payment
+    #[test]
+    #[should_panic(expected = "Token not approved for routing")]
+    fn test_route_payment_revoked_token() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Revoke the previously approved token
+        fixture.router_client.set_approved_token(&fixture.token_client.address, &false);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[1u8; 32]);
+        fixture.fund_learner(&learner, 1000);
+
+        // This should panic because the token has been revoked
+        fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &1000,
+            &fixture.token_client.address,
+        );
+    }
+
+    /// Test: Unknown token address defaults to not-approved
+    #[test]
+    fn test_unknown_token_not_approved() {
+        let env = Env::default();
+        let (admin, escrow_contract, bridge_receiver, _, client) = setup_env(&env);
+        client.init(&admin, &escrow_contract, &bridge_receiver);
+
+        for _ in 0..5 {
+            let random_token = Address::generate(&env);
+            assert!(
+                !client.is_token_approved(&random_token),
+                "unknown tokens must default to not-approved"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Integration tests (with token whitelist)
+    // =========================================================================
+
     #[test]
     fn test_stellar_direct_payment() {
         let fixture = IntegrationFixture::setup();
         let learner = Address::generate(&fixture.env);
         let mentor = Address::generate(&fixture.env);
 
-        // Fund the learner with tokens
         let amount = 1000i128;
         fixture.fund_learner(&learner, amount);
 
         let tx_hash = BytesN::from_array(&fixture.env, &[1u8; 32]);
 
-        // Route a Stellar direct payment
         let escrow_id = fixture.router_client.route_payment(
             &CHAIN_STELLAR,
             &tx_hash,
@@ -906,20 +1021,12 @@ mod test {
             &fixture.token_client.address,
         );
 
-        // Verify escrow ID was returned (should be 1 for first escrow)
         assert_eq!(escrow_id, 1);
-
-        // Verify route was stored
         let stored_escrow_id = fixture.router_client.get_route(&tx_hash);
         assert_eq!(stored_escrow_id, escrow_id);
-
-        // Verify transaction is marked as processed
         assert!(fixture.router_client.is_tx_processed(&tx_hash));
-
-        // Verify route count increased
         assert_eq!(fixture.router_client.get_route_count(), 1);
 
-        // Verify route details
         let route = fixture.router_client.get_route_details(&tx_hash);
         assert_eq!(route.source_chain, CHAIN_STELLAR);
         assert_eq!(route.learner, learner);
@@ -927,12 +1034,6 @@ mod test {
         assert_eq!(route.amount, amount);
     }
 
-    // =========================================================================
-    // BRIDGED ETH PAYMENT TEST
-    // =========================================================================
-
-    /// Test routing a bridged ETH payment
-    /// This verifies that cross-chain payments via bridge are properly routed
     #[test]
     fn test_bridged_eth_payment() {
         let fixture = IntegrationFixture::setup();
@@ -940,12 +1041,10 @@ mod test {
         let mentor = Address::generate(&fixture.env);
 
         let tx_hash = BytesN::from_array(&fixture.env, &[2u8; 32]);
-        let amount = 5000i128; // 5000 units (e.g., USDC from ETH)
+        let amount = 5000i128;
 
-        // Mark the VAA as processed in the mock bridge receiver
         fixture.mark_bridge_vaa_processed(&tx_hash);
 
-        // Route the bridged ETH payment
         let escrow_id = fixture.router_client.route_payment(
             &CHAIN_ETHEREUM,
             &tx_hash,
@@ -955,24 +1054,13 @@ mod test {
             &fixture.token_client.address,
         );
 
-        // Verify escrow was created
         assert_eq!(escrow_id, 1);
-
-        // Verify route details show ETH as source chain
         let route = fixture.router_client.get_route_details(&tx_hash);
         assert_eq!(route.source_chain, CHAIN_ETHEREUM);
         assert_eq!(route.amount, amount);
-
-        // Verify transaction is marked as processed
         assert!(fixture.router_client.is_tx_processed(&tx_hash));
     }
 
-    // =========================================================================
-    // DUPLICATE ROUTING PREVENTION TEST
-    // =========================================================================
-
-    /// Test that duplicate routing is prevented
-    /// This ensures the same transaction cannot be routed twice (replay protection)
     #[test]
     #[should_panic(expected = "Transaction already routed")]
     fn test_duplicate_routing_prevention() {
@@ -980,13 +1068,11 @@ mod test {
         let learner = Address::generate(&fixture.env);
         let mentor = Address::generate(&fixture.env);
 
-        // Fund the learner
         let amount = 1000i128;
         fixture.fund_learner(&learner, amount);
 
         let tx_hash = BytesN::from_array(&fixture.env, &[3u8; 32]);
 
-        // Route payment first time - should succeed
         let escrow_id_1 = fixture.router_client.route_payment(
             &CHAIN_STELLAR,
             &tx_hash,
@@ -997,7 +1083,7 @@ mod test {
         );
         assert_eq!(escrow_id_1, 1);
 
-        // Attempt to route the same transaction again - should panic
+        // Attempt duplicate — should panic
         fixture.router_client.route_payment(
             &CHAIN_STELLAR,
             &tx_hash,
@@ -1008,17 +1094,14 @@ mod test {
         );
     }
 
-    /// Test that different transactions get different escrow IDs
     #[test]
     fn test_multiple_routes_different_ids() {
         let fixture = IntegrationFixture::setup();
         let learner = Address::generate(&fixture.env);
         let mentor = Address::generate(&fixture.env);
 
-        // Fund learner with enough for multiple payments
         fixture.fund_learner(&learner, 3000);
 
-        // Route first payment
         let tx_hash_1 = BytesN::from_array(&fixture.env, &[1u8; 32]);
         let escrow_id_1 = fixture.router_client.route_payment(
             &CHAIN_STELLAR,
@@ -1029,7 +1112,6 @@ mod test {
             &fixture.token_client.address,
         );
 
-        // Route second payment
         let tx_hash_2 = BytesN::from_array(&fixture.env, &[2u8; 32]);
         let escrow_id_2 = fixture.router_client.route_payment(
             &CHAIN_STELLAR,
@@ -1040,27 +1122,20 @@ mod test {
             &fixture.token_client.address,
         );
 
-        // Verify different escrow IDs
         assert_ne!(escrow_id_1, escrow_id_2);
         assert_eq!(escrow_id_1, 1);
         assert_eq!(escrow_id_2, 2);
-
-        // Verify route count
         assert_eq!(fixture.router_client.get_route_count(), 2);
-
-        // Verify both routes are stored and accessible
         assert_eq!(fixture.router_client.get_route(&tx_hash_1), escrow_id_1);
         assert_eq!(fixture.router_client.get_route(&tx_hash_2), escrow_id_2);
     }
 
-    /// Test that bridged payments from different chains are properly distinguished
     #[test]
     fn test_bridged_payments_different_chains() {
         let fixture = IntegrationFixture::setup();
         let learner = Address::generate(&fixture.env);
         let mentor = Address::generate(&fixture.env);
 
-        // Route from Ethereum
         let tx_hash_eth = BytesN::from_array(&fixture.env, &[10u8; 32]);
         fixture.mark_bridge_vaa_processed(&tx_hash_eth);
         let escrow_id_eth = fixture.router_client.route_payment(
@@ -1072,7 +1147,6 @@ mod test {
             &fixture.token_client.address,
         );
 
-        // Route from BSC
         let tx_hash_bsc = BytesN::from_array(&fixture.env, &[20u8; 32]);
         fixture.mark_bridge_vaa_processed(&tx_hash_bsc);
         let escrow_id_bsc = fixture.router_client.route_payment(
@@ -1084,10 +1158,8 @@ mod test {
             &fixture.token_client.address,
         );
 
-        // Verify different escrow IDs
         assert_ne!(escrow_id_eth, escrow_id_bsc);
 
-        // Verify source chains are recorded correctly
         let route_eth = fixture.router_client.get_route_details(&tx_hash_eth);
         let route_bsc = fixture.router_client.get_route_details(&tx_hash_bsc);
 
@@ -1095,7 +1167,6 @@ mod test {
         assert_eq!(route_bsc.source_chain, CHAIN_BSC);
     }
 
-    /// Test route not found error
     #[test]
     #[should_panic(expected = "Route not found")]
     fn test_get_route_not_found() {
@@ -1104,12 +1175,10 @@ mod test {
 
         client.init(&admin, &escrow_contract, &bridge_receiver);
 
-        // Try to get route for non-existent transaction
         let tx_hash = BytesN::from_array(&env, &[99u8; 32]);
         client.get_route(&tx_hash);
     }
 
-    /// Test that negative amounts are rejected
     #[test]
     #[should_panic(expected = "Amount must be positive")]
     fn test_route_payment_negative_amount() {
@@ -1128,7 +1197,6 @@ mod test {
         );
     }
 
-    /// Test that bridged payment fails when bridge hasn't verified the transaction
     #[test]
     #[should_panic(expected = "Bridge transaction not verified")]
     fn test_bridged_payment_not_verified() {
@@ -1137,7 +1205,6 @@ mod test {
         let mentor = Address::generate(&fixture.env);
 
         let tx_hash = BytesN::from_array(&fixture.env, &[5u8; 32]);
-        // Don't mark VAA as processed - should fail
 
         fixture.router_client.route_payment(
             &CHAIN_ETHEREUM,
