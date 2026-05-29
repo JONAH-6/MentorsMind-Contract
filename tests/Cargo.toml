@@ -22,6 +22,10 @@ mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"
 mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
 mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
 mentorminds-lending-pool = { path = "../contracts/lending_pool", features = ["testutils"] }
+mentorminds-upgrade-registry = { path = "../contracts/upgrade_registry", features = ["testutils"] }
+mentorminds-pause-guardian = { path = "../contracts/pause_guardian", features = ["testutils"] }
+mentorminds-dispute-evidence = { path = "../contracts/dispute_evidence", features = ["testutils"] }
+mentorminds-referral = { path = "../contracts/referral", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -60,3 +64,11 @@ path = "cancellation/mod.rs"
 [[test]]
 name = "multi_mentor_tests"
 path = "multi_mentor/mod.rs"
+
+[[test]]
+name = "fee_precision_tests"
+path = "fee_precision_tests.rs"
+
+[[test]]
+name = "upgrade_safety_tests"
+path = "upgrade_safety_tests.rs"
