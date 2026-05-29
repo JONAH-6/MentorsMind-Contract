@@ -100,3 +100,38 @@ To run the partial release tests, invoke the standard `cargo test` command in th
 ```bash
 cargo test --package mentorminds-integration-tests --test integration_test partial_release::
 ```
+
+---
+
+# Refund Testing
+
+This section documents the scenarios for testing standard, partial, and yield-bearing refund logic within the `escrow` contract. Ensuring robust refund handling guarantees capital protection across all potential escrow states.
+
+## Overview
+
+Refund operations are generally invoked by the platform admin in the event of unresolvable disputes, cancellations, or SLA breaches. Testing confirms that funds are properly remitted to the `learner` while respecting the integrity of the state machine. 
+
+## Test Cases Covered
+
+The `tests/refund/mod.rs` integration test suite validates the following critical paths:
+
+### 1. Refund from Active State
+Validates the standard cancellation path where an admin refunds a freshly created (Active/Pending) escrow. The full principal is transferred back to the learner, and the escrow is marked as `Refunded`.
+
+### 2. Refund after Dispute Resolution
+Tests refund behavior when an escrow enters a `Disputed` state. Ensures that invoking a refund correctly overrides the dispute, returns funds to the learner, and finalizes the escrow to `Refunded`.
+
+### 3. Partial Refund Scenarios
+Verifies the custom `partial_refund` functionality. Confirms that issuing a partial refund deducts from the principal and transfers the specific amount back to the learner, while keeping the escrow `Active` until the remainder is fully drained.
+
+### 4. Refund with Yield
+Tests the `refund_with_yield` logic, allowing the admin to return the base principal along with accrued yield (e.g., from external staking). Confirms that both the principal and the specified yield value are transferred accurately.
+
+### 5. Authorization Checks
+Asserts that only the authorized `Admin` can trigger a refund. Unauthorized callers correctly encounter panic conditions, preserving the immutable security of the locked capital.
+
+## Execution
+To run the refund tests, invoke the standard `cargo test` command in the `MentorsMind-Contract` root directory:
+```bash
+cargo test --package mentorminds-integration-tests --test integration_test refund::
+```
