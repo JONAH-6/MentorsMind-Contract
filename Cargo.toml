@@ -2,29 +2,50 @@
 resolver = "2"
 members = [
     "escrow",
-    "tests",
     "contracts/allowance",
-    "contracts/bridge_receiver",
-    "contracts/credit_score",
+    "contracts/bounty",
     "contracts/escrow_factory",
-    "contracts/forum",
-    "contracts/governance",
     "contracts/interface_registry",
-    "contracts/kyc_registry",
-    "contracts/mnt-token",
+    "contracts/verification",
     "contracts/oracle",
     "contracts/payment_router",
     "contracts/referral",
-    "contracts/reputation",
+    "contracts/referral_leaderboard",
     "contracts/session_nft",
-    "contracts/shared",
     "contracts/staking",
-    "contracts/streak_rewards",
     "contracts/subscription_analytics",
     "contracts/timelock",
     "contracts/treasury",
     "contracts/verification",
     "contracts/vesting",
+    "contracts/payment_router",
+    "contracts/streak_rewards",
+    "contracts/shared",
+    "contracts/rbac",
+    "contracts/dispute_evidence",
+    "contracts/session_oracle",
+    "contracts/proposal_templates",
+    "contracts/upgrade_registry",
+    "contracts/rate_limiter",
+    "contracts/performance_bond",
+    "contracts/health_dashboard",
+    "contracts/reputation",
+    "contracts/session_registry",
+    "contracts/kyc_registry",
+    "contracts/cert_showcase",
+    "contracts/lending_pool",
+    "contracts/collateral_loan",
+    "contracts/velocity_limits",
+    "contracts/endorsements",
+    "contracts/prediction_market",
+    "tests",
+
+    "contracts/isa",
+    "contracts/pause_guardian",
+    "contracts/insurance",
+    "contracts/anomaly_detector",
+    "contracts/subscription",
+    "contracts/multisig_admin",
 ]
 
 [workspace.package]
@@ -33,8 +54,8 @@ edition = "2021"
 rust-version = "1.70"
 
 [workspace.dependencies]
-soroban-sdk = "21.7.0"
-soroban-token-sdk = "21.7.0"
+soroban-sdk = "21.0.0"
+soroban-token-sdk = "21.0.0"
 
 [profile.release]
 opt-level = "z"

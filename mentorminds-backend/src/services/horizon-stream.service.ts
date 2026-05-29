@@ -1,10 +1,38 @@
 import { eventIndexerService } from "./event-indexer.service";
 import { ParsedEvent, ContractEvent } from "../types/event-indexer.types";
+import { paymentTrackerService } from "./payment-tracker.service";
+import { getRedisClient } from "./redis.service";
+
+const CURSOR_KEY_PREFIX = 'mm:horizon:cursor';
+
+const LARGE_PAYMENT_THRESHOLD = parseFloat(
+  process.env.LARGE_TX_ALERT_THRESHOLD_XLM ??
+  process.env.LARGE_PAYMENT_THRESHOLD_XLM ?? // legacy fallback
+  "1000"
+);
+
+// Rate-limit large-payment alerts: track the last alert time per sender address.
+// Only one alert per unique `from` address per hour to prevent alert storms.
+const ALERT_RATE_LIMIT_MS = 60 * 60 * 1000; // 1 hour
+const lastAlertTimestampByAddress = new Map<string, number>();
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
+const PLATFORM_STELLAR_ACCOUNT = process.env.PLATFORM_STELLAR_ACCOUNT ?? "";
+const USER_WALLET_ACCOUNTS = (process.env.HORIZON_STREAM_ACCOUNTS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 const STREAM_RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 5;
+
+function splitAccountList(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
 // Known MentorMinds contract IDs to monitor (update after deployment)
 const MONITORED_CONTRACTS = new Set<string>([
@@ -63,6 +91,50 @@ export class HorizonStreamService {
   private retryCount = 0;
 
   /**
+   * Stellar accounts that belong to the platform operator (ingress treasury,
+   * admin, etc.). Used for discovery and docs — not for opening one SSE stream
+   * per mentee/mentor wallet.
+   *
+   * Peer-to-peer user payments are confirmed via tx hash + payment webhook
+   * (see `stellar-stream.service` / `stellar-monitor.service`), not by listing
+   * every user public key here.
+   */
+  getPlatformAccounts(): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    const primary = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+    if (primary) {
+      seen.add(primary);
+      out.push(primary);
+    }
+
+    for (const id of splitAccountList(process.env.HORIZON_PLATFORM_EXTRA_ACCOUNTS)) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Horizon `/events` URL. When `accountId` is set, scopes the stream to that
+   * account; otherwise all contract events (no account filter).
+   */
+  buildEventsUrl(cursor: string, accountId?: string): string {
+    const params = new URLSearchParams({
+      type: "contract",
+      cursor,
+    });
+    if (accountId) {
+      params.set("account", accountId);
+    }
+    return `${HORIZON_URL}/events?${params.toString()}`;
+  }
+
+  /**
    * Start streaming contract events from Horizon
    * Uses cursor-based pagination to avoid re-processing
    */
@@ -76,13 +148,29 @@ export class HorizonStreamService {
     this.retryCount = 0;
     this.abortController = new AbortController();
 
-    const cursorState = eventIndexerService.getCursorState();
-    const cursor = cursorState.lastCursor || cursorState.lastLedger.toString();
+    const streamAccount = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+    const redisKey = `${CURSOR_KEY_PREFIX}:${streamAccount || 'global'}`;
+    const persistedCursor = await getRedisClient().get(redisKey).catch(() => null);
 
-    console.log(`[HorizonStream] Starting stream from cursor: ${cursor}`);
+    const cursorState = eventIndexerService.getCursorState();
+    const cursor = persistedCursor ?? cursorState.lastCursor ?? cursorState.lastLedger.toString() || 'now';
+
+    console.log(`[HorizonStream] Starting stream from cursor: ${cursor}${persistedCursor ? ' (from Redis)' : ''}`);
 
     try {
-      await this.streamEvents(cursor);
+      const platformAccounts = this.getPlatformAccounts();
+
+      if (streamAccount) {
+        console.log(
+          `[HorizonStream] SSE scoped to PLATFORM_STELLAR_ACCOUNT; operator wallet list length=${platformAccounts.length}`
+        );
+        await this.streamEvents(cursor, streamAccount);
+      } else {
+        console.warn(
+          "[HorizonStream] PLATFORM_STELLAR_ACCOUNT unset — streaming all contract events (set PLATFORM_STELLAR_ACCOUNT to scope ingress)"
+        );
+        await this.streamEvents(cursor);
+      }
     } catch (error) {
       console.error("[HorizonStream] Stream error:", error);
       this.handleStreamError();
@@ -104,8 +192,8 @@ export class HorizonStreamService {
   /**
    * Stream events from Horizon with exponential backoff
    */
-  private async streamEvents(cursor: string): Promise<void> {
-    const url = `${HORIZON_URL}/events?account=&type=contract&cursor=${cursor}`;
+  private async streamEvents(cursor: string, accountId?: string): Promise<void> {
+    const url = this.buildEventsUrl(cursor, accountId);
 
     try {
       const response = await fetch(url, {
@@ -158,6 +246,22 @@ export class HorizonStreamService {
         throw error;
       }
     }
+  }
+
+
+  private getStreamAccounts(): string[] {
+    const seen = new Set<string>();
+    const accounts: string[] = [];
+
+    for (const accountId of [PLATFORM_STELLAR_ACCOUNT, ...USER_WALLET_ACCOUNTS]) {
+      if (!accountId || seen.has(accountId)) {
+        continue;
+      }
+      seen.add(accountId);
+      accounts.push(accountId);
+    }
+
+    return accounts;
   }
 
   /**
@@ -219,8 +323,12 @@ export class HorizonStreamService {
       // Save to database
       await eventIndexerService.saveEvent(contractEvent);
 
-      // Update cursor state
+      // Update cursor state in memory and persist to Redis
       eventIndexerService.updateCursorState(ledger, parsed.paging_token);
+      const account = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim() || 'global';
+      await getRedisClient()
+        .set(`${CURSOR_KEY_PREFIX}:${account}`, parsed.paging_token ?? ledger.toString())
+        .catch((err) => console.error('[HorizonStream] Failed to persist cursor to Redis:', err));
     } catch (error) {
       console.error("[HorizonStream] Error processing event data:", error);
     }
@@ -288,9 +396,14 @@ export class HorizonStreamService {
 
     setTimeout(() => {
       if (this.isRunning) {
-        this.streamEvents(
-          eventIndexerService.getCursorState().lastCursor || "now"
-        );
+        const cursor =
+          eventIndexerService.getCursorState().lastCursor || "now";
+        const streamAccount = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+        if (streamAccount) {
+          this.streamEvents(cursor, streamAccount);
+        } else {
+          this.streamEvents(cursor);
+        }
       }
     }, delay);
   }
@@ -385,6 +498,299 @@ export class HorizonStreamService {
       return [];
     }
   }
+
+  /**
+   * Process incoming payment operation with amount verification.
+   * 
+   * Security checks:
+   * 1. Matches payment to pending transaction by from/to addresses
+   * 2. Verifies payment amount >= expected amount
+   * 3. Marks as underpaid if amount is insufficient
+   * 4. Logs security alerts for mismatched amounts
+   * 5. Alerts on large unmatched payments
+   * 
+   * @param payment - Payment details from Stellar network
+   * @param account - Account that received the payment
+   */
+  async processPaymentOperation(payment: {
+    from: string;
+    to: string;
+    amount: string;
+    asset: string;
+    txHash?: string;
+    ledger?: number;
+  }, account: string): Promise<void> {
+    const { securityAlertService } = await import('./security-alert.service');
+    
+    // Find pending transactions that match sender and receiver addresses
+    const pendingTransactions = await paymentTrackerService.findPending();
+    const matchingTransactions = pendingTransactions.filter(tx =>
+      tx.senderAddress === payment.from &&
+      tx.receiverAddress === payment.to
+    );
+
+    if (matchingTransactions.length === 0) {
+      // No matching transaction - alert if large payment
+      await this.alertOnLargeIncomingTransaction(payment, account);
+      return;
+    }
+
+    // Check each matching transaction for amount verification
+    for (const transaction of matchingTransactions) {
+      const expectedAmount = parseFloat(transaction.amount);
+      const receivedAmount = parseFloat(payment.amount);
+
+      // Validate amounts are valid numbers
+      if (isNaN(expectedAmount) || isNaN(receivedAmount)) {
+        console.error('[HorizonStream] Invalid amount format:', {
+          transactionId: transaction.id,
+          expectedAmount: transaction.amount,
+          receivedAmount: payment.amount,
+        });
+        
+        await securityAlertService.logAlert({
+          type: 'payment_amount_mismatch',
+          severity: 'high',
+          message: 'Invalid amount format in payment verification',
+          details: {
+            transactionId: transaction.id,
+            expectedAmount: transaction.amount,
+            receivedAmount: payment.amount,
+            from: payment.from,
+            to: payment.to,
+            txHash: payment.txHash,
+          },
+        });
+        
+        continue;
+      }
+
+      // CRITICAL SECURITY CHECK: Verify received amount >= expected amount
+      if (receivedAmount < expectedAmount) {
+        // Payment is underpaid - mark as underpaid and alert
+        const shortfall = expectedAmount - receivedAmount;
+        const shortfallPercentage = ((shortfall / expectedAmount) * 100).toFixed(2);
+
+        console.error('[HorizonStream] SECURITY ALERT: Underpaid transaction detected', {
+          transactionId: transaction.id,
+          expectedAmount: transaction.amount,
+          receivedAmount: payment.amount,
+          shortfall: shortfall.toFixed(7),
+          shortfallPercentage: `${shortfallPercentage}%`,
+          from: payment.from,
+          to: payment.to,
+          asset: payment.asset,
+          txHash: payment.txHash,
+        });
+
+        await securityAlertService.logAlert({
+          type: 'underpaid_transaction',
+          severity: 'high',
+          message: `Transaction underpaid by ${shortfall.toFixed(7)} ${payment.asset} (${shortfallPercentage}%)`,
+          details: {
+            transactionId: transaction.id,
+            expectedAmount: transaction.amount,
+            receivedAmount: payment.amount,
+            shortfall: shortfall.toFixed(7),
+            shortfallPercentage,
+            from: payment.from,
+            to: payment.to,
+            asset: payment.asset,
+            txHash: payment.txHash,
+            ledger: payment.ledger,
+          },
+        });
+
+        // Mark transaction as underpaid
+        await paymentTrackerService.updateStatus(
+          transaction.id,
+          'underpaid',
+          {
+            ledgerSequence: payment.ledger,
+            errorCode: 'UNDERPAID',
+            errorMessage: `Payment underpaid: expected ${transaction.amount} ${payment.asset}, received ${payment.amount} ${payment.asset}. Shortfall: ${shortfall.toFixed(7)} ${payment.asset}`,
+          }
+        );
+
+        // TODO: Notify user about underpayment
+        // await notificationService.notifyUnderpayment({
+        //   userId: transaction.sessionId,
+        //   expectedAmount: transaction.amount,
+        //   receivedAmount: payment.amount,
+        //   shortfall: shortfall.toFixed(7),
+        // });
+
+        continue;
+      }
+
+      // Amount verification passed - confirm transaction
+      console.log('[HorizonStream] Payment verified and confirmed:', {
+        transactionId: transaction.id,
+        expectedAmount: transaction.amount,
+        receivedAmount: payment.amount,
+        from: payment.from,
+        to: payment.to,
+        asset: payment.asset,
+        txHash: payment.txHash,
+      });
+
+      await paymentTrackerService.updateStatus(
+        transaction.id,
+        'confirmed',
+        {
+          ledgerSequence: payment.ledger,
+        }
+      );
+
+      // If received amount > expected amount, log for informational purposes
+      if (receivedAmount > expectedAmount) {
+        const overpayment = receivedAmount - expectedAmount;
+        console.log('[HorizonStream] Payment overpaid (informational):', {
+          transactionId: transaction.id,
+          expectedAmount: transaction.amount,
+          receivedAmount: payment.amount,
+          overpayment: overpayment.toFixed(7),
+          from: payment.from,
+          to: payment.to,
+        });
+
+        await securityAlertService.logAlert({
+          type: 'suspicious_payment',
+          severity: 'low',
+          message: `Transaction overpaid by ${overpayment.toFixed(7)} ${payment.asset}`,
+          details: {
+            transactionId: transaction.id,
+            expectedAmount: transaction.amount,
+            receivedAmount: payment.amount,
+            overpayment: overpayment.toFixed(7),
+            from: payment.from,
+            to: payment.to,
+            asset: payment.asset,
+            txHash: payment.txHash,
+          },
+        });
+      }
+    }
+  }
+
+  /**
+   * Alert admins about large incoming transactions that don't match any pending transaction.
+   * This helps detect anomalies like unexpected high-value payments.
+   *
+   * Fix #377:
+   * - Only called from the unmatched-payment branch (never for matched payments).
+   * - Rate-limited to one alert per unique sender address per hour.
+   * - Threshold configurable via LARGE_TX_ALERT_THRESHOLD_XLM env var (default 1000).
+   * - Alert includes a human-readable reason field.
+   */
+  private async alertOnLargeIncomingTransaction(
+    payment: { from: string; to: string; amount: string; asset: string; txHash?: string },
+    account: string
+  ): Promise<void> {
+    const amountNum = parseFloat(payment.amount);
+
+    if (isNaN(amountNum)) {
+      console.error('[HorizonStream] Invalid amount in large payment check:', payment.amount);
+      return;
+    }
+
+    if (amountNum >= LARGE_PAYMENT_THRESHOLD) {
+      // Rate-limit: skip if we already alerted for this sender within the last hour.
+      const now = Date.now();
+      const lastAlert = lastAlertTimestampByAddress.get(payment.from) ?? 0;
+      if (now - lastAlert < ALERT_RATE_LIMIT_MS) {
+        console.log(
+          `[HorizonStream] Rate-limiting large-payment alert for sender ${payment.from} (last alert ${Math.round((now - lastAlert) / 1000)}s ago)`
+        );
+        return;
+      }
+      lastAlertTimestampByAddress.set(payment.from, now);
+
+      const reason = `Unrecognized large payment received — no matching pending transaction found for sender ${payment.from}`;
+
+      console.warn(
+        `[HorizonStream] ALERT: Large unmatched payment detected`,
+        {
+          from: payment.from,
+          to: payment.to,
+          amount: payment.amount,
+          asset: payment.asset,
+          account,
+          txHash: payment.txHash,
+          reason,
+        }
+      );
+
+      const { securityAlertService } = await import('./security-alert.service');
+      await securityAlertService.logAlert({
+        type: 'large_unmatched_payment',
+        severity: 'medium',
+        message: reason,
+        details: {
+          from: payment.from,
+          to: payment.to,
+          amount: payment.amount,
+          asset: payment.asset,
+          account,
+          txHash: payment.txHash,
+          threshold: LARGE_PAYMENT_THRESHOLD,
+          reason,
+        },
+      });
+
+      // TODO: Send email alert to admins
+      // await emailService.sendAlert({
+      //   subject: 'Large Unmatched Payment Detected',
+      //   body: `${reason}\n\nDetails:\nFrom: ${payment.from}\nTo: ${payment.to}\nAmount: ${payment.amount} ${payment.asset}\nAccount: ${account}\nTx Hash: ${payment.txHash}`,
+      // });
+    }
+  }
+
+  /**
+   * Reconciliation job: cross-check unconfirmed pending transactions older
+   * than 5 minutes against Horizon's transaction history and confirm any that
+   * are found to be successful on-chain.
+   */
+  async reconcilePendingTransactions(): Promise<void> {
+    const STALE_MS = 5 * 60 * 1000;
+    const cutoff = new Date(Date.now() - STALE_MS);
+
+    const pending = await paymentTrackerService.findPending();
+    const stale = pending.filter((tx) => tx.createdAt < cutoff);
+
+    if (stale.length === 0) return;
+
+    console.log(`[HorizonStream] Reconciling ${stale.length} stale pending transaction(s)`);
+
+    for (const tx of stale) {
+      if (!tx.txHash) continue;
+      try {
+        const url = `${HORIZON_URL}/transactions/${tx.txHash}`;
+        const res = await fetch(url);
+        if (!res.ok) continue; // 404 = not yet on-chain, skip
+
+        const data = (await res.json()) as { successful: boolean; ledger: number };
+        if (data.successful) {
+          await paymentTrackerService.updateStatus(tx.id, 'confirmed', {
+            ledgerSequence: data.ledger,
+          });
+          console.log(`[HorizonStream] Reconciled tx ${tx.txHash} → confirmed (ledger ${data.ledger})`);
+        }
+      } catch (err) {
+        console.error(`[HorizonStream] Reconciliation error for tx ${tx.txHash}:`, err);
+      }
+    }
+  }
 }
 
 export const horizonStreamService = new HorizonStreamService();
+
+/** Schedule reconciliation every 5 minutes. Call once at startup. */
+export function startReconciliationJob(intervalMs = 5 * 60 * 1000): NodeJS.Timeout {
+  return setInterval(
+    () => horizonStreamService.reconcilePendingTransactions().catch((err) =>
+      console.error('[HorizonStream] Reconciliation job error:', err)
+    ),
+    intervalMs
+  );
+}
