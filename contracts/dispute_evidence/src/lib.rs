@@ -1,3 +1,17 @@
+//! Dispute Evidence Contract
+//!
+//! Allows the mentor or learner to attach off-chain evidence references to a
+//! disputed escrow during a bounded submission window. An arbitrator may then
+//! submit a resolution after a mandatory review delay.
+//!
+//! # Workflow
+//! 1. Learner or mentor opens a dispute on the escrow contract.
+//! 2. Either party calls [`DisputeEvidenceContract::submit_evidence`] with a
+//!    `Symbol` pointing to an off-chain document (e.g. IPFS CID, content hash).
+//! 3. An arbitrator calls [`DisputeEvidenceContract::submit_resolution`] after
+//!    `MIN_RESOLUTION_DELAY_SECS` have elapsed since the dispute was opened.
+//! 4. The admin uses the on-chain resolution record to call `resolve_dispute`
+//!    on the escrow contract.
 #![no_std]
 
 use soroban_sdk::{
