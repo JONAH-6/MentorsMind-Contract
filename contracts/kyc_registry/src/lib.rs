@@ -1,10 +1,11 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol,
 };
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd)]
 pub enum KycLevel {
     None = 0,
     Basic = 1,
@@ -23,7 +24,13 @@ pub struct KycRecord {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    Rbac,
     Kyc(Address),
+}
+
+#[contractclient(name = "RbacContractClient")]
+pub trait RbacContractTrait {
+    fn has_role(env: Env, role: Symbol, account: Address) -> bool;
 }
 
 #[contract]
@@ -39,15 +46,21 @@ impl KycRegistry {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
+    pub fn set_rbac_contract(env: Env, admin: Address, rbac: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Rbac, &rbac);
+    }
+
     /// Set the KYC level for a user. Admin only.
     pub fn set_kyc_level(
         env: Env,
+        operator: Address,
         user: Address,
         level: KycLevel,
         expiry: u64,
         provider_hash: BytesN<32>,
     ) {
-        Self::require_admin(&env);
+        Self::require_operator(&env, &operator);
 
         let record = KycRecord {
             level,
@@ -88,8 +101,8 @@ impl KycRegistry {
     }
 
     /// Revoke KYC for a user immediately. Admin only.
-    pub fn revoke_kyc(env: Env, user: Address) {
-        Self::require_admin(&env);
+    pub fn revoke_kyc(env: Env, operator: Address, user: Address) {
+        Self::require_operator(&env, &operator);
 
         env.storage()
             .persistent()
@@ -99,13 +112,39 @@ impl KycRegistry {
     }
 
     /// Internal helper to require admin authorization.
-    fn require_admin(env: &Env) {
+    fn require_admin(env: &Env, admin: &Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if stored_admin != *admin {
+            panic!("Not authorized");
+        }
+    }
+
+    fn require_operator(env: &Env, operator: &Address) {
+        operator.require_auth();
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("Not initialized");
-        admin.require_auth();
+        if admin == *operator {
+            return;
+        }
+
+        let rbac: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Rbac)
+            .expect("RBAC not configured");
+        if !RbacContractClient::new(env, &rbac)
+            .has_role(&Symbol::new(env, "KYC_OPERATOR"), operator)
+        {
+            panic!("Not authorized");
+        }
     }
 }
 

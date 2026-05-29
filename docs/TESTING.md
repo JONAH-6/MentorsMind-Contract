@@ -1,102 +1,43 @@
-# Fee Calculation Testing
+# Test Strategy
 
-This document describes the testing scenarios and verification steps for the fee calculation logic in the MentorMinds contract ecosystem, particularly covering `escrow` and `payment_router` contracts.
+This repository uses layered Rust tests to validate contract behavior before deployment.
 
-## Overview
+## Test Structure
 
-Fee calculation logic is pivotal to platform economics. The maximum allowable fee across the platform is hardcapped at 10% (1,000 basis points). All fees are calculated using integer math to ensure deterministic results across the Soroban VM, applying standard truncation (rounding down) as typical in blockchain arithmetic.
+- `tests/` contains integration tests that exercise multiple contracts together.
+- Each contract crate can also expose unit tests for contract-local state transitions and guard rails.
+- Snapshot tests are used where the exact emitted event or serialized output matters.
 
-## Test Cases Covered
+## What the Test Suite Covers
 
-The `tests/fees/mod.rs` integration test suite validates the following scenarios:
+- Authorization and ownership checks.
+- Escrow lifecycle transitions.
+- Upgrade and version tracking behavior.
+- Oracle, risk, and dispute scenarios that can regress silently if left untested.
+- Event emission correctness and ordering for state-changing operations (`tests/events/`).
+- Event emission correctness and ordering checks (`tests/events/`).
+- TTL bumping and persistence checks for long-lived storage keys (`tests/ttl/`).
 
-### 1. Various Fee Percentages
-The calculation logic is tested against the following standard fee percentages:
-- **1%** (100 bps)
-- **2.5%** (250 bps)
-- **5%** (500 bps)
-- **10%** (1000 bps)
+## Testing Guidelines
 
-### 2. Various Principal Amounts
-To ensure precision scaling, fee scenarios run against a matrix of base amounts ranging from small values (e.g., `100` units) to large values (e.g., `1,000,000` units).
+- Test the full success path and the most important failure path for every new behavior.
+- Prefer clear setup helpers over repeated inline fixture construction.
+- Use ledger timestamps and generated addresses deliberately so the test intent is easy to read.
+- When changing storage keys, event payloads, or validation rules, add a regression test in the same change.
 
-### 3. Edge Cases
-- **Zero Fee Scenario**: Validates that when fee basis points are configured to `0`, the calculated fee is strictly `0` with no transaction panics or math errors.
-- **Maximum Fee Scenario**: Asserts that calculating fees at the extreme maximum (10% / 1000 bps) behaves properly and correctly limits platform extraction.
+## Coverage Goals
 
-### 4. Precision and Rounding
-Since the calculation executes as `(amount * fee_bps) / 10000`, the tests verify that fractional units are appropriately truncated. 
-- *Example*: A 2.5% fee on a principal of `105` mathematically evaluates to `2.625`. The tests verify that the smart contract calculates this strictly as `2`.
+- Critical security and authorization paths should always have direct test coverage.
+- State transitions should be verified for valid and invalid moves.
+- New public contract entrypoints should ship with at least one positive and one negative test.
 
-## Execution
-To run the fee calculation tests, invoke the standard `cargo test` command in the `MentorsMind-Contract` root directory:
-```bash
-cargo test --package mentorminds-integration-tests --test integration_test fees::
-```
+## Example
 
----
-
-# Token Approval Testing
-
-This section details the testing scenarios for the token whitelist management logic in the `escrow` and `treasury` contracts. Ensuring only approved tokens are allowed for operations guarantees compliance and avoids exposure to malicious or unsupported assets.
-
-## Overview
-
-Token whitelists restrict contract interactions to pre-approved Stellar assets. Both the `escrow` contract (during session creation) and the `treasury` contract (during deposits) strictly enforce this check.
-
-## Test Cases Covered
-
-The `tests/token_approval/mod.rs` integration test suite validates the following critical paths:
-
-### 1. Token Approval by Admin
-Verifies that only an authorized admin can add a token to the whitelist by calling `set_approved_token(&token_address, &true)`. Once added, `is_token_approved` correctly evaluates to `true` on both the `escrow` and `treasury` contracts.
-
-### 2. Token Rejection / Removal by Admin
-Confirms that an admin can dynamically revoke a previously approved token using `set_approved_token(&token_address, &false)`. Subsequent checks on the token yield `false`.
-
-### 3. Escrow Creation with Approved Tokens
-Tests the happy path where a learner successfully creates a session escrow (`create_escrow`) funded with a token that exists on the whitelist. The contract effectively transfers the token and successfully provisions the escrow.
-
-### 4. Escrow Creation with Unapproved Tokens (Fails)
-Tests the failure path by deliberately attempting to initialize an escrow with an unapproved or removed token. The transaction accurately reverts/panics with the `Token not approved` constraint error.
-
-## Execution
-To run the token approval tests, invoke the standard `cargo test` command in the `MentorsMind-Contract` root directory:
-```bash
-cargo test --package mentorminds-integration-tests --test integration_test token_approval::
-```
-
----
-
-# Partial Release Testing
-
-This section outlines the testing scenarios for multi-session partial release logic in the `escrow` contract. Partial releases allow mentors to withdraw funds incrementally upon the completion of individual sessions within a multi-session engagement, without waiting for the entire package to conclude.
-
-## Overview
-
-When an escrow is created for a bundle of sessions (`total_sessions > 1`), funds are initially locked. `release_partial` calculates the proportionate share for a single session, deducts the applicable platform fee, and transfers the net amount to the mentor. The final session triggers a state transition on the escrow to `Released`.
-
-## Test Cases Covered
-
-The `tests/partial_release/mod.rs` integration test suite validates the following multi-session scenarios:
-
-### 1. Partial Release for 2-Session Escrow
-Verifies the math and state transitions for a simple 2-session bundle. The first release correctly transfers 50% of the principal and fees, incrementing `sessions_completed`. The second release transfers the remainder and correctly finalizes the escrow status to `Released`.
-
-### 2. Partial Release for 5-Session Escrow
-Validates sequential iterative releases over a larger `total_sessions` scale. Checks that iterating `release_partial` correctly loops until completion without panic or state corruption.
-
-### 3. Partial Release for 10-Session Escrow
-Ensures the integer math safely computes fractional divisions correctly without losing precision or locking residual dust in the contract for a 10-session package. 
-
-### 4. Sequential Partial Releases & State Finality
-Validates that calling `release_partial` after the maximum number of sessions have been completed results in an appropriate failure (`Completed`). Ensures double-releases are mechanically impossible.
-
-### 5. Partial Release with Disputes
-Tests the intersection of partial releases and the dispute resolution state machine. For example, verifying a scenario where session 1 completes successfully (mentor gets paid) but session 2 falls into dispute. It validates that the correct unreleased remainder is successfully refunded to the learner without interfering with the funds already released.
-
-## Execution
-To run the partial release tests, invoke the standard `cargo test` command in the `MentorsMind-Contract` root directory:
-```bash
-cargo test --package mentorminds-integration-tests --test integration_test partial_release::
+```rust
+#[test]
+fn release_requires_authorization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Arrange the escrow state, then assert the release call fails or succeeds as expected.
+}
 ```

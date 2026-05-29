@@ -1,0 +1,198 @@
+================================================================================
+FIXES FOR ISSUES #257-260: Transaction Confirmation, Dispute Order, Network 
+Verification, and Escrow Worker Bounds
+================================================================================
+
+ISSUE #257: StellarSorobanClient.invoke Does Not Wait for Transaction Confirmation
+-----------------------------------------------------------------------------------
+File: mentorminds-backend/src/services/sorobanEscrow.service.ts
+
+PROBLEM:
+- invoke() called sendTransaction() and returned immediately with PENDING status
+- Returned txHash for transactions that might never be confirmed
+- No polling for transaction confirmation
+
+FIX IMPLEMENTED:
+1. Added waitForTransaction() method that polls getTransaction() until SUCCESS/FAILED
+   - Default timeout: 30 seconds
+   - Poll interval: 2 seconds
+   - Throws error with XDR details if transaction fails
+
+2. Updated invoke() method to:
+   - Submit transaction via sendTransaction()
+   - Wait for confirmation via waitForTransaction()
+   - Only return txHash after SUCCESS status confirmed
+
+3. Added TransactionResult interface for type safety
+
+CODE CHANGES:
+- Added waitForTransaction(txHash, timeoutMs, pollIntervalMs) method
+- Modified invoke(preparedTx) to wait for confirmation before returning
+- Added proper error handling with XDR result for debugging
+
+
+ISSUE #258: EscrowApiService.openDispute Creates DB Record Before On-Chain Call
+--------------------------------------------------------------------------------
+File: mentorminds-backend/src/services/escrow-api.service.ts
+
+PROBLEM:
+- DB dispute record created BEFORE on-chain openDispute call
+- If on-chain call fails, DB has inconsistent state
+- Auto-release job would still release funds (on-chain not disputed)
+
+FIX IMPLEMENTED:
+1. Reversed operation order:
+   - Call SorobanEscrowService.openDispute() FIRST
+   - Only update DB after on-chain confirmation
+   - Throw error if on-chain call fails (no DB update)
+
+2. Updated openDispute() signature to include required parameters:
+   - escrowId: string
+   - raisedBy: string (user who raised the dispute)
+   - reason: string (dispute reason)
+
+3. Added interface methods to SorobanEscrowService:
+   - openDispute(input): Promise<{ txHash: string }>
+   - resolveDispute(input): Promise<{ txHash: string }>
+
+4. Updated all test files to use new signature
+
+CODE CHANGES:
+- Modified openDispute() to call on-chain first, then update DB
+- Added proper error handling for on-chain failures
+- Updated SorobanEscrowService interface with new methods
+- Added stub implementations in SorobanEscrowServiceImpl
+- Updated tests: escrow-api-transitions.test.ts, escrow.lifecycle.test.ts
+
+NOTE: When disputes table is created, add on_chain_dispute_tx_hash column to track
+the transaction hash from the on-chain openDispute call.
+
+
+ISSUE #259: SorobanEscrowService Does Not Handle Network Mismatch
+------------------------------------------------------------------
+Files: 
+- mentorminds-backend/src/services/sorobanEscrow.service.ts
+
+PROBLEM:
+- STELLAR_NETWORK and SOROBAN_RPC_URL configured independently
+- Mainnet passphrase + testnet RPC = rejected transactions
+- Testnet passphrase + mainnet RPC = real funds affected by test operations
+
+FIX IMPLEMENTED:
+1. Added verifyNetworkPassphrase() method to StellarSorobanClient:
+   - Calls rpcServer.getNetwork() at startup
+   - Compares returned passphrase with configured networkPassphrase
+   - Throws error if mismatch detected
+
+2. Enhanced verifyContractVersion() in SorobanEscrowServiceImpl:
+   - Added try-catch around network verification
+   - Sets configured = false on mismatch
+   - Provides detailed error message with expected vs actual passphrase
+
+3. Updated StellarSorobanClient constructor:
+   - Stores rpcServer instance
+   - Stores networkPassphrase for verification
+
+CODE CHANGES:
+- Added verifyNetworkPassphrase() to StellarSorobanClient
+- Enhanced error messages in verifyContractVersion()
+- Added network verification to startup checks
+- Improved error handling with try-catch blocks
+
+USAGE:
+const client = new StellarSorobanClient(feesService);
+await client.verifyNetworkPassphrase(); // Call at startup
+
+
+ISSUE #260: escrowCheckWorker Has No Upper Bound on Escrow Age
+---------------------------------------------------------------
+Files:
+- mentorminds-backend/src/jobs/escrowCheck.worker.ts
+- mentorminds-backend/migrations/034_add_escrow_release_tracking.sql
+- mentorminds-backend/migrations/schema.sql
+
+PROBLEM:
+- findEligibleEscrows had no upper age bound
+- Ancient escrows (6+ months old) retried indefinitely
+- Each retry consumed RPC quota
+- Potential duplicate on-chain operations
+
+FIX IMPLEMENTED:
+1. Added upper age bound: 30 days
+   - Escrows older than 30 days are not processed
+   - Prevents processing ancient stuck escrows
+
+2. Added retry attempt tracking:
+   - New column: release_attempts (default 0)
+   - Incremented on each attempt
+   - Max 5 attempts before flagging as stuck
+
+3. Added cooldown period: 1 hour
+   - New column: last_release_attempt_at
+   - Prevents hammering RPC with repeated attempts
+   - Escrows skipped if attempted within last hour
+
+4. Added stuck escrow alerting:
+   - alertStuckEscrows() method identifies escrows exceeding max attempts
+   - Logs error with escrow details for admin intervention
+   - TODO: Integrate with monitoring system (email, Slack, PagerDuty)
+
+5. Updated SQL query with bounds:
+   WHERE status IN ('funded', 'pending')
+   AND created_at < NOW() - (48 * INTERVAL '1 hour')      -- Lower bound
+   AND created_at > NOW() - (30 * INTERVAL '1 day')       -- Upper bound
+   AND COALESCE(release_attempts, 0) < 5                  -- Max attempts
+   AND (last_release_attempt_at IS NULL 
+        OR last_release_attempt_at < NOW() - (1 * INTERVAL '1 hour'))  -- Cooldown
+
+DATABASE CHANGES:
+- Migration 034_add_escrow_release_tracking.sql:
+  * ALTER TABLE escrows ADD COLUMN release_attempts INTEGER DEFAULT 0
+  * ALTER TABLE escrows ADD COLUMN last_release_attempt_at TIMESTAMPTZ
+  * CREATE INDEX idx_escrows_auto_release for efficient querying
+
+- Updated schema.sql to reflect new columns
+
+CODE CHANGES:
+- Added constants: MAX_ESCROW_AGE_DAYS, MAX_RELEASE_ATTEMPTS, RETRY_COOLDOWN_HOURS
+- Enhanced checkAutoRelease() with bounded query
+- Added processAutoRelease() to increment attempts and update timestamp
+- Added alertStuckEscrows() for admin notifications
+- Improved logging with attempt counts and age information
+
+
+TESTING:
+--------
+All modified files pass TypeScript diagnostics with no errors:
+- mentorminds-backend/src/services/sorobanEscrow.service.ts ✓
+- mentorminds-backend/src/services/escrow-api.service.ts ✓
+- mentorminds-backend/src/jobs/escrowCheck.worker.ts ✓
+- mentorminds-backend/tests/escrow-api-transitions.test.ts ✓
+- mentorminds-backend/tests/escrow.lifecycle.test.ts ✓
+
+
+MIGRATION REQUIRED:
+-------------------
+Run the following migration to add escrow release tracking:
+  psql -d mentorminds -f mentorminds-backend/migrations/034_add_escrow_release_tracking.sql
+
+
+NEXT STEPS:
+-----------
+1. Run database migration 034_add_escrow_release_tracking.sql
+2. Wire up actual Soroban contract invocations in SorobanEscrowServiceImpl
+3. Implement admin alerting system for stuck escrows (email/Slack/PagerDuty)
+4. Add on_chain_dispute_tx_hash column to disputes table when created
+5. Test transaction confirmation polling with real Soroban RPC
+6. Verify network passphrase check at application startup
+
+
+SUMMARY:
+--------
+✓ Issue #257: Transaction confirmation polling implemented
+✓ Issue #258: Dispute creation order fixed (on-chain first, then DB)
+✓ Issue #259: Network passphrase verification added
+✓ Issue #260: Escrow worker bounds and retry limits implemented
+
+All fixes maintain backward compatibility where possible and include proper
+error handling, logging, and documentation.

@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
@@ -30,8 +31,12 @@ pub struct StakeRecord {
     pub mentor: Address,
     pub amount: i128,
     pub staked_at: u64,
-    pub unlock_at: u64,
-    pub tier: u32,
+        // Add cooldown_until timestamp to lock out staking after unstake
+        pub unlock_cooldown_until: Option<u64> = None,
+
+        pub tier: u32,
+    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,8 +48,12 @@ pub struct StakeRecord {
 pub struct StakedEventData {
     pub mentor: Address,
     pub amount: i128,
-    pub unlock_at: u64,
-    pub tier: u32,
+        // Add cooldown_until timestamp to lock out staking after unstake
+        pub unlock_cooldown_until: Option<u64> = None,
+
+        pub tier: u32,
+    }
+    }
 }
 
 #[contracttype]
@@ -64,6 +73,8 @@ pub enum DataKey {
     Admin,
     MNTToken,
     Stake(Address),
+    Stakers,
+    TotalStaked,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,13 +110,11 @@ impl StakingContract {
     /// Initialize the staking contract.
     /// Must be called once before any other function.
     pub fn initialize(env: Env, admin: Address, mnt_token: Address) -> Result<(), Error> {
-        if env.storage().persistent().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::MNTToken, &mnt_token);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
         Ok(())
     }
 
@@ -122,7 +131,8 @@ impl StakingContract {
         amount: i128,
         lock_period_days: u32,
     ) -> Result<(), Error> {
-        if !env.storage().persistent().has(&DataKey::Admin) {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "stake"));
+        if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
 
@@ -142,7 +152,7 @@ impl StakingContract {
 
         let mnt_token: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::MNTToken)
             .ok_or(Error::NotInitialized)?;
 
@@ -151,8 +161,8 @@ impl StakingContract {
         token_client.transfer(&mentor, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        let lock_seconds = (lock_period_days as u64) * 86_400u64;
-        let unlock_at = now + lock_seconds;
+        let lock_seconds = (lock_period_days as u64).checked_mul(86_400u64).expect("Overflow");
+        let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
         let tier = compute_tier(amount);
 
         let record = StakeRecord {
@@ -166,6 +176,26 @@ impl StakingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Stake(mentor.clone()), &record);
+
+        // Update stakers list and total staked
+        let mut stakers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !stakers.contains(&mentor) {
+            stakers.push_back(mentor.clone());
+            env.storage().persistent().set(&DataKey::Stakers, &stakers);
+        }
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalStaked, &(total_staked.checked_add(amount).expect("Overflow")));
 
         env.events().publish(
             (
@@ -191,7 +221,8 @@ impl StakingContract {
     ///
     /// Auth: `mentor` must authorize this call.
     pub fn unstake(env: Env, mentor: Address) -> Result<(), Error> {
-        if !env.storage().persistent().has(&DataKey::Admin) {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "unstake"));
+        if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
 
@@ -210,7 +241,7 @@ impl StakingContract {
 
         let mnt_token: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::MNTToken)
             .ok_or(Error::NotInitialized)?;
 
@@ -220,6 +251,26 @@ impl StakingContract {
         env.storage()
             .persistent()
             .remove(&DataKey::Stake(mentor.clone()));
+
+        // Update stakers list and total staked
+        let mut stakers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if let Some(index) = stakers.first_index_of(&mentor) {
+            stakers.remove(index);
+            env.storage().persistent().set(&DataKey::Stakers, &stakers);
+        }
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalStaked, &(total_staked.checked_sub(record.amount).expect("Underflow")));
 
         env.events().publish(
             (
@@ -251,6 +302,22 @@ impl StakingContract {
             .persistent()
             .get::<DataKey, StakeRecord>(&DataKey::Stake(mentor))
             .map(|r| r.tier)
+            .unwrap_or(0)
+    }
+
+    /// Return all current stakers.
+    pub fn get_stakers(env: Env) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Return the total amount staked in the contract.
+    pub fn get_total_staked(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
             .unwrap_or(0)
     }
 }
