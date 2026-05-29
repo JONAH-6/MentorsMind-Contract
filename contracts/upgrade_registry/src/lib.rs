@@ -13,12 +13,20 @@ use soroban_sdk::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    NotAdmin           = 3,
-    ContractNotFound   = 4,
-    AlreadySubscribed  = 5,
-    NotSubscribed      = 6,
+    AlreadyInitialized  = 1,
+    NotInitialized      = 2,
+    NotAdmin            = 3,
+    ContractNotFound    = 4,
+    AlreadySubscribed   = 5,
+    NotSubscribed       = 6,
+    /// New version must be strictly greater than the current version.
+    VersionNotMonotonic = 7,
+    /// A timelock delay must elapse before the upgrade executes.
+    TimelockNotElapsed  = 8,
+    /// An upgrade is already pending; cancel it first.
+    UpgradePending      = 9,
+    /// No pending upgrade to execute or cancel.
+    NoPendingUpgrade    = 10,
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +47,26 @@ pub struct UpgradeRecord {
 // Storage Keys
 // ---------------------------------------------------------------------------
 
+/// A pending (time-locked) upgrade waiting for the delay to elapse.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// WASM hash to apply when the timelock expires.
+    pub new_wasm_hash:    BytesN<32>,
+    /// Human-readable contract name for registry bookkeeping.
+    pub contract_name:    Symbol,
+    /// New version number (must be > current version).
+    pub new_version:      u32,
+    /// Changelog hash for audit trail.
+    pub changelog_hash:   BytesN<32>,
+    /// Ledger timestamp at which this upgrade was scheduled.
+    pub scheduled_at:     u64,
+    /// Earliest timestamp at which `execute_pending_upgrade` may be called.
+    pub executable_after: u64,
+    /// Admin that initiated the upgrade.
+    pub admin:            Address,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -46,7 +74,14 @@ pub enum DataKey {
     UpgradeHistory(Symbol),
     LatestVersion(Symbol),
     Subscribers(Symbol),
+    /// Stores the single pending upgrade (only one may be in-flight at a time).
+    PendingUpgrade,
+    /// Minimum timelock delay in seconds for upgrades (default 48 h).
+    UpgradeDelay,
 }
+
+/// Default upgrade timelock: 48 hours.
+const DEFAULT_UPGRADE_DELAY: u64 = 48 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -68,6 +103,197 @@ impl UpgradeRegistryContract {
             admin,
         );
         Ok(())
+    }
+
+    // ─── Upgrade delay configuration ─────────────────────────────────────
+
+    /// Set the minimum timelock delay (seconds) that must elapse between
+    /// scheduling and executing an upgrade. Admin only.
+    ///
+    /// Must be between 1 hour and 30 days.
+    pub fn set_upgrade_delay(env: Env, delay_secs: u64) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let min = 3_600_u64;       // 1 hour
+        let max = 30 * 24 * 3_600_u64; // 30 days
+        if delay_secs < min || delay_secs > max {
+            panic!("upgrade delay out of range [1h, 30d]");
+        }
+        env.storage().instance().set(&DataKey::UpgradeDelay, &delay_secs);
+        Ok(())
+    }
+
+    /// Return the current upgrade delay in seconds.
+    pub fn get_upgrade_delay(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeDelay)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY)
+    }
+
+    // ─── Two-step time-locked upgrade ────────────────────────────────────
+
+    /// Schedule a UUPS upgrade. Admin only.
+    ///
+    /// The upgrade will not execute immediately — `execute_pending_upgrade`
+    /// must be called after `get_upgrade_delay()` seconds have elapsed.
+    /// Only one upgrade may be pending at a time.
+    ///
+    /// # Safety guards
+    /// - Re-initialization is prevented: `initialize` checks storage before
+    ///   writing, so calling it again is a no-op error.
+    /// - Version monotonicity: `new_version` must be strictly greater than the
+    ///   current latest version for `contract_name`.
+    /// - Timelock: the upgrade cannot execute until the delay has elapsed.
+    pub fn schedule_upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        contract_name: Symbol,
+        new_version: u32,
+        changelog_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        // Guard: only one pending upgrade at a time.
+        if env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(Error::UpgradePending);
+        }
+
+        // Guard: version must be strictly monotonically increasing.
+        let current_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(contract_name.clone()))
+            .unwrap_or(0);
+        if new_version <= current_version {
+            return Err(Error::VersionNotMonotonic);
+        }
+
+        let delay = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeDelay)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY);
+
+        let now = env.ledger().timestamp();
+        let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            contract_name: contract_name.clone(),
+            new_version,
+            changelog_hash: changelog_hash.clone(),
+            scheduled_at: now,
+            executable_after: now.saturating_add(delay),
+            admin: admin.clone(),
+        };
+
+        env.storage().instance().set(&DataKey::PendingUpgrade, &pending);
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("sched"), contract_name),
+            (new_version, now.saturating_add(delay), new_wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Execute the pending upgrade once the timelock has elapsed. Admin only.
+    ///
+    /// Applies the WASM swap, records the upgrade in history, and clears the
+    /// pending slot.
+    pub fn execute_pending_upgrade(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::NoPendingUpgrade)?;
+
+        // Guard: timelock must have elapsed.
+        if env.ledger().timestamp() < pending.executable_after {
+            return Err(Error::TimelockNotElapsed);
+        }
+
+        // Record upgrade history.
+        let old_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestVersion(pending.contract_name.clone()))
+            .unwrap_or(0);
+
+        let record = UpgradeRecord {
+            old_version,
+            new_version: pending.new_version,
+            changelog_hash: pending.changelog_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+            admin: admin.clone(),
+        };
+
+        let mut history: Vec<UpgradeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UpgradeHistory(pending.contract_name.clone()))
+            .unwrap_or(Vec::new(&env));
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeHistory(pending.contract_name.clone()), &history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LatestVersion(pending.contract_name.clone()), &pending.new_version);
+
+        // Clear pending slot before WASM swap to prevent re-entrancy.
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("exec"), pending.contract_name),
+            (old_version, pending.new_version, pending.new_wasm_hash.clone()),
+        );
+
+        // Apply the UUPS upgrade.
+        env.deployer().update_current_contract_wasm(pending.new_wasm_hash);
+
+        Ok(())
+    }
+
+    /// Cancel a scheduled (pending) upgrade. Admin only.
+    pub fn cancel_pending_upgrade(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if !env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(Error::NoPendingUpgrade);
+        }
+
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("cancel")),
+            (),
+        );
+        Ok(())
+    }
+
+    /// Return the pending upgrade, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
     /// UUPS upgrade: replace this contract's WASM with a new version.
