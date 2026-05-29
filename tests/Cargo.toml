@@ -19,6 +19,7 @@ mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"
 mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
 mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
 mentorminds-payment-router = { path = "../contracts/payment_router", features = ["testutils"] }
+mentorminds-treasury = { path = "../contracts/treasury", features = ["testutils"] }
 
 [dev-dependencies]
 

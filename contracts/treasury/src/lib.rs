@@ -30,6 +30,7 @@ pub enum DataKey {
     Admin,
     StakingContract,
     History,
+    ApprovedToken(Address),
 }
 
 #[contract]
@@ -58,6 +59,10 @@ impl TreasuryContract {
     /// Accept deposits of any approved Stellar asset
     pub fn deposit(env: Env, from: Address, token: Address, amount: i128) -> Result<(), Error> {
         from.require_auth();
+
+        if !Self::_is_token_approved(&env, &token) {
+            panic!("Token not approved");
+        }
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&from, &env.current_contract_address(), &amount);
@@ -210,6 +215,33 @@ impl TreasuryContract {
             .get::<DataKey, Vec<AllocationHistory>>(&DataKey::History)
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    /// Manage token whitelist
+    pub fn set_approved_token(env: Env, token: Address, approved: bool) -> Result<(), Error> {
+        let admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovedToken(token), &approved);
+            
+        Ok(())
+    }
+    
+    pub fn is_token_approved(env: Env, token: Address) -> bool {
+        Self::_is_token_approved(&env, &token)
+    }
+    
+    fn _is_token_approved(env: &Env, token: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ApprovedToken(token.clone()))
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -280,11 +312,33 @@ mod tests {
         stellar_asset_client.mint(&user, &1000);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        
+        // Approve token first
+        treasury_client.set_approved_token(&token_addr, &true);
+        
         treasury_client.deposit(&user, &token_addr, &500);
 
         assert_eq!(treasury_client.get_balance(&token_addr), 500);
         assert_eq!(token_client.balance(&user), 500);
         assert_eq!(token_client.balance(&contract_id), 500);
+    }
+
+    #[test]
+    #[should_panic(expected = "Token not approved")]
+    fn test_deposit_unapproved_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _, contract_id) = setup_test(&env);
+        let user = Address::generate(&env);
+        let token_addr = env.register_stellar_asset_contract(admin.clone());
+        let token_client = token::Client::new(&env, &token_addr);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_addr);
+
+        stellar_asset_client.mint(&user, &1000);
+
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        // Do not approve token
+        treasury_client.deposit(&user, &token_addr, &500);
     }
 
     #[test]
