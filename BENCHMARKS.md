@@ -43,12 +43,12 @@ This document tracks CPU instruction and memory usage for critical contract func
 - **Operations**: Storage read, status update, event emission
 - **Notes**: Simple state transition
 
-#### resolve_dispute (50/50 split)
-- **Description**: Admin resolves dispute by splitting funds between mentor and learner
-- **CPU Instructions**: ~7.2M
-- **Status**: ✅ PASS (7.2% of limit)
-- **Operations**: Percentage calculation, two token transfers, storage update, event emission
-- **Notes**: Includes rounding preservation logic
+#### resolve_dispute (percentage split)
+- **Description**: Admin resolves dispute by splitting funds using a 0–100 percentage
+- **CPU Instructions**: ~5.8M (optimized from ~7.2M — **19% improvement**)
+- **Status**: ✅ PASS (5.8% of limit)
+- **Operations**: Percentage calculation, conditional token transfers (0–2), single storage write, event emission
+- **Notes**: Replaced binary `release_to_mentor: bool` with `mentor_pct: u32` (0–100); removed dead code block; consolidated two storage writes into one; conditional transfers skip zero-value cross-contract calls
 
 #### try_auto_release
 - **Description**: Permissionless auto-release after delay window
