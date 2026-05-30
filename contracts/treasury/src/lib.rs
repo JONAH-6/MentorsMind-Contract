@@ -38,7 +38,9 @@ pub struct TreasuryTokenApprovalEvent {
 pub enum DataKey {
     Admin,
     StakingContract,
-    History,
+    AllocationCount,
+    /// Individual allocation history: DataKey::Allocation(index) → AllocationHistory
+    Allocation(u32),
     /// Token whitelist: DataKey::ApprovedToken(token_address) → bool
     ApprovedToken(Address),
 }
@@ -58,10 +60,9 @@ impl TreasuryContract {
             .persistent()
             .set(&DataKey::StakingContract, &staking_contract);
 
-        let empty_history: Vec<AllocationHistory> = Vec::new(&env);
         env.storage()
             .persistent()
-            .set(&DataKey::History, &empty_history);
+            .set(&DataKey::AllocationCount, &0u32);
 
         Ok(())
     }
@@ -130,8 +131,6 @@ impl TreasuryContract {
 
         // *** STRICT TOKEN WHITELIST VALIDATION ***
         if !Self::_is_token_approved(&env, &token) {
-            return Err(Error::TokenNotApproved);
-        if !Self::_is_token_approved(&env, &token) {
             panic!("Token not approved");
         }
 
@@ -176,20 +175,23 @@ impl TreasuryContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &recipient, &amount);
 
-        // Track allocation history
-        let mut history = env
+        // Track allocation history with counter-based keying
+        let count: u32 = env
             .storage()
             .persistent()
-            .get::<DataKey, Vec<AllocationHistory>>(&DataKey::History)
-            .unwrap_or_else(|| Vec::new(&env));
+            .get(&DataKey::AllocationCount)
+            .unwrap_or(0u32);
 
-        history.push_back(AllocationHistory {
-            token: token.clone(),
-            recipient: recipient.clone(),
-            amount,
-            timestamp: env.ledger().timestamp(),
-        });
-        env.storage().persistent().set(&DataKey::History, &history);
+        env.storage().persistent().set(
+            &DataKey::Allocation(count),
+            &AllocationHistory {
+                token: token.clone(),
+                recipient: recipient.clone(),
+                amount,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        env.storage().persistent().set(&DataKey::AllocationCount, &(count + 1));
 
         // Emit allocated event
         env.events().publish(
@@ -260,6 +262,7 @@ impl TreasuryContract {
         mnt_token: Address,
         dex_contract: Address,
         xlm_amount: i128,
+        min_mnt_out: i128,
     ) -> Result<(), Error> {
         let admin = env
             .storage()
@@ -287,6 +290,11 @@ impl TreasuryContract {
             (xlm_token.clone(), mnt_token.clone(), xlm_amount).into_val(&env),
         );
 
+        // Validate minimum output to prevent slippage attacks
+        if mnt_received < min_mnt_out {
+            panic!("Slippage exceeded: insufficient MNT received from DEX");
+        }
+
         // 3. Burn MNT
         env.invoke_contract::<()>(
             &mnt_token,
@@ -301,38 +309,27 @@ impl TreasuryContract {
         Ok(())
     }
 
-    pub fn get_history(env: Env) -> Vec<AllocationHistory> {
-        env.storage()
-            .persistent()
-            .get::<DataKey, Vec<AllocationHistory>>(&DataKey::History)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Manage token whitelist
-    pub fn set_approved_token(env: Env, token: Address, approved: bool) -> Result<(), Error> {
-        let admin = env
+    pub fn get_history_page(env: Env, offset: u32, limit: u32) -> Vec<AllocationHistory> {
+        let total_count: u32 = env
             .storage()
             .persistent()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        
-        env.storage()
-            .persistent()
-            .set(&DataKey::ApprovedToken(token), &approved);
-            
-        Ok(())
-    }
-    
-    pub fn is_token_approved(env: Env, token: Address) -> bool {
-        Self::_is_token_approved(&env, &token)
-    }
-    
-    fn _is_token_approved(env: &Env, token: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::ApprovedToken(token.clone()))
-            .unwrap_or(false)
+            .get(&DataKey::AllocationCount)
+            .unwrap_or(0u32);
+
+        let mut result = Vec::new(&env);
+        let end = offset.saturating_add(limit).min(total_count);
+
+        for i in offset..end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AllocationHistory>(&DataKey::Allocation(i))
+            {
+                result.push_back(record);
+            }
+        }
+
+        result
     }
 }
 
@@ -407,10 +404,6 @@ mod tests {
 
         // Approve the token first
         treasury_client.set_approved_token(&token_addr, &true);
-
-        
-        // Approve token first
-        treasury_client.set_approved_token(&token_addr, &true);
         
         treasury_client.deposit(&user, &token_addr, &500);
 
@@ -420,7 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deposit_unapproved_token_fails() {
     #[should_panic(expected = "Token not approved")]
     fn test_deposit_unapproved_token() {
         let env = Env::default();
@@ -428,17 +420,13 @@ mod tests {
         let (admin, _, contract_id) = setup_test(&env);
         let user = Address::generate(&env);
         let token_addr = env.register_stellar_asset_contract(admin.clone());
-        let token_client = token::Client::new(&env, &token_addr);
         let stellar_asset_client = token::StellarAssetClient::new(&env, &token_addr);
 
         stellar_asset_client.mint(&user, &1000);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
 
-        // Do NOT approve the token — deposit should fail
-        let result = treasury_client.try_deposit(&user, &token_addr, &500);
-        assert!(result.is_err(), "unapproved token deposit must fail");
-        // Do not approve token
+        // Do not approve token - deposit should panic
         treasury_client.deposit(&user, &token_addr, &500);
     }
 
@@ -465,7 +453,7 @@ mod tests {
         assert_eq!(treasury_client.get_balance(&token_addr), 600);
         assert_eq!(token_client.balance(&recipient), 400);
 
-        let history = treasury_client.get_history();
+        let history = treasury_client.get_history_page(&0, &10);
         assert_eq!(history.len(), 1);
         let entry = history.get(0).unwrap();
         assert_eq!(entry.token, token_addr);
@@ -551,7 +539,7 @@ mod tests {
         treasury_client.set_approved_token(&xlm_addr, &true);
         treasury_client.set_approved_token(&mnt_addr, &true);
 
-        treasury_client.buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000);
+        treasury_client.buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000, &500);
 
         assert_eq!(xlm_client.balance(&contract_id), 0);
         assert_eq!(xlm_client.balance(&dex_addr), 1000);
@@ -573,7 +561,7 @@ mod tests {
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
 
         // Do NOT approve tokens — buyback should fail
-        let result = treasury_client.try_buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000);
+        let result = treasury_client.try_buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000, &500);
         assert!(result.is_err(), "unapproved token buyback must fail");
     }
 

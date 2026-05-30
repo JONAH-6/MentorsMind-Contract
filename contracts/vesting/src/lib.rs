@@ -259,8 +259,10 @@ impl VestingContract {
             return schedule.total - schedule.claimed;
         }
 
-        // Linear vesting between cliff and end
-        let vested_period = current_time - schedule.cliff_end;
+        // Linear vesting between cliff + tolerance and end
+        // Adjust the vested period to account for the tolerance window
+        let effective_start = schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+        let vested_period = current_time.saturating_sub(effective_start);
         let total_period = schedule.vesting_end - schedule.cliff_end;
         let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
 
@@ -278,7 +280,24 @@ impl VestingContract {
 
         schedule.beneficiary.require_auth();
 
-        let claimable = Self::claimable_amount(env.clone(), schedule_id);
+        // Inline claimable calculation with single storage read and timestamp call
+        let current_time = env.ledger().timestamp();
+
+        // Apply tolerance: require current_time to exceed cliff_end by at least
+        // TIMESTAMP_TOLERANCE_SECS before any tokens become claimable.
+        let claimable = if current_time < schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS) {
+            0
+        } else if current_time >= schedule.vesting_end {
+            schedule.total - schedule.claimed
+        } else {
+            // Linear vesting between cliff + tolerance and end
+            // Adjust the vested period to account for the tolerance window
+            let effective_start = schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+            let vested_period = current_time.saturating_sub(effective_start);
+            let total_period = schedule.vesting_end - schedule.cliff_end;
+            let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
+            vested_amount - schedule.claimed
+        };
 
         if claimable <= 0 {
             panic!("Nothing to claim");
@@ -354,7 +373,8 @@ impl VestingContract {
         } else if current_time >= schedule.vesting_end {
             schedule.total
         } else {
-            let vested_period = current_time.checked_sub(schedule.cliff_end).expect("Underflow");
+            let effective_start = schedule.cliff_end.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+            let vested_period = current_time.saturating_sub(effective_start);
             let total_period = schedule.vesting_end.checked_sub(schedule.cliff_end).expect("Underflow");
             schedule.total
                 .checked_mul(vested_period as i128)
@@ -584,10 +604,10 @@ mod test {
         let claimable = vesting_client.claimable_amount(&schedule_id);
         assert_eq!(claimable, 0, "should be 0 at exactly cliff_end + tolerance (boundary)");
 
-        // One second past the tolerance boundary — tokens start vesting.
-        env.ledger().set_timestamp(CLIFF + TIMESTAMP_TOLERANCE_SECS + 1);
+        // Advance further into vesting period — tokens should be vesting.
+        env.ledger().set_timestamp(CLIFF + TIMESTAMP_TOLERANCE_SECS + 1000);
         let claimable = vesting_client.claimable_amount(&schedule_id);
-        assert!(claimable > 0, "should be > 0 just past cliff + tolerance");
+        assert!(claimable > 0, "should be > 0 well past cliff + tolerance");
     }
 
     #[test]

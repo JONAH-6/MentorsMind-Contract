@@ -160,10 +160,7 @@ impl VelocityLimitsContract {
 
     pub fn get_usage(env: Env, user: Address) -> (i128, i128) {
         let now = env.ledger().timestamp();
-        let (txs, daily_used, monthly_used) = Self::load_usage(&env, &user.clone(), now);
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserTxs(user), &txs);
+        let (_txs, daily_used, monthly_used) = Self::load_usage(&env, &user.clone(), now);
         (daily_used, monthly_used)
     }
 
