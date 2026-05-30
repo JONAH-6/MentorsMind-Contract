@@ -168,6 +168,8 @@ impl VelocityLimitsContract {
     }
 
     pub fn reset_daily(env: Env) {
+        Self::require_admin(&env);
+
         let now = env.ledger().timestamp();
         let last: u64 = env
             .storage()
@@ -376,11 +378,26 @@ mod tests {
         assert!(f.velocity().check_and_record(&f.user, &500));
         assert_eq!(f.velocity().get_usage(&f.user).0, 500);
 
-        // Move past 24h and run permissionless reset.
+        // Move past 24h and run the admin-only reset.
         f.env.ledger().set_timestamp(1_000 + DAY_SECS + 1);
         f.velocity().reset_daily();
 
         // Daily usage drops to zero due to rolling 24h window expiry, monthly stays.
+        let usage = f.velocity().get_usage(&f.user);
+        assert_eq!(usage.0, 0);
+        assert_eq!(usage.1, 500);
+    }
+
+    #[test]
+    fn test_daily_usage_expires_without_reset() {
+        let f = Fixture::setup();
+        f.env.ledger().set_timestamp(1_000);
+
+        assert!(f.velocity().check_and_record(&f.user, &500));
+        assert_eq!(f.velocity().get_usage(&f.user).0, 500);
+
+        f.env.ledger().set_timestamp(1_000 + DAY_SECS + 1);
+
         let usage = f.velocity().get_usage(&f.user);
         assert_eq!(usage.0, 0);
         assert_eq!(usage.1, 500);
