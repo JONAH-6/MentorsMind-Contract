@@ -110,10 +110,10 @@ impl ReputationContract {
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
 
-        let current_sum: u32 = env.storage().persistent().get(&sum_key).unwrap_or(0u32);
-        let current_count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0u32);
+        let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
+        let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
 
-        let new_sum = current_sum.checked_add(rating).expect("sum overflow");
+        let new_sum = current_sum.checked_add(rating as u64).expect("sum overflow");
         let new_count = current_count.checked_add(1).expect("count overflow");
 
         env.storage().persistent().set(&sum_key, &new_sum);
@@ -137,12 +137,12 @@ impl ReputationContract {
     }
 
     /// Returns (avg_rating * 100, review_count) for a mentor.
-    pub fn get_mentor_rating(env: Env, mentor: Address) -> (u32, u32) {
+    pub fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64) {
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
 
-        let sum: u32 = env.storage().persistent().get(&sum_key).unwrap_or(0);
-        let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+        let sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0);
+        let count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
 
         if count == 0 {
             return (0, 0);

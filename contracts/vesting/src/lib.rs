@@ -431,7 +431,7 @@ impl VestingContract {
             ScheduleRevokedEventData {
                 schedule_id,
                 beneficiary: schedule.beneficiary.clone(),
-                refunded_amount: refund_amount,
+                refunded_amount: unvested_amount,
             },
         );
     }
