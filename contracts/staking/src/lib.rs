@@ -75,6 +75,7 @@ pub enum DataKey {
     Stake(Address),
     Stakers,
     TotalStaked,
+    PendingRewards(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +319,85 @@ impl StakingContract {
         env.storage()
             .persistent()
             .get(&DataKey::TotalStaked)
+            .unwrap_or(0)
+    }
+
+    /// Distribute rewards to stakers pro-rata based on their stake amounts.
+    /// Called by the treasury contract when revenue is distributed.
+    pub fn distribute_revenue(env: Env, token: Address, amount: i128) {
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        if total_staked == 0 {
+            return;
+        }
+
+        let stakers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        for staker in stakers.iter() {
+            let record: StakeRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Stake(staker.clone()))
+                .unwrap();
+
+            let share = (record.amount * amount) / total_staked;
+
+            if share > 0 {
+                let pending: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::PendingRewards(staker.clone()))
+                    .unwrap_or(0);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PendingRewards(staker.clone()), &(pending + share));
+            }
+        }
+    }
+
+    /// Claim pending rewards for a staker.
+    /// Transfers the pending rewards to the staker's address.
+    pub fn claim_rewards(env: Env, staker: Address, token: Address) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_rewards"));
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        staker.require_auth();
+
+        let pending: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRewards(staker.clone()))
+            .unwrap_or(0);
+
+        if pending == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &staker, &pending);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingRewards(staker.clone()));
+
+        Ok(())
+    }
+
+    /// Get the pending rewards for a staker.
+    pub fn get_pending_rewards(env: Env, staker: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingRewards(staker))
             .unwrap_or(0)
     }
 }
