@@ -2,3 +2,4 @@
 pub mod interoperability;
 pub mod fees;
 pub mod token_approval;
+pub mod partial_release;
