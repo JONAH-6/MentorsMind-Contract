@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::EscrowRecord;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
 };
@@ -34,42 +35,6 @@ pub enum DataKey {
 pub const TIER_SILVER: u32 = 100;
 pub const TIER_GOLD: u32 = 500;
 pub const TIER_PLATINUM: u32 = 1000;
-
-// ── Escrow status mirror (must match escrow contract) ────────────────────────
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowStatus {
-    Active,
-    Released,
-    Disputed,
-    Refunded,
-    Resolved,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowInfo {
-    pub id: u64,
-    pub mentor: Address,
-    pub learner: Address,
-    pub amount: i128,
-    pub session_id: Symbol,
-    pub status: EscrowStatus,
-    pub created_at: u64,
-    pub token_address: Address,
-    pub platform_fee: i128,
-    pub net_amount: i128,
-    pub session_end_time: u64,
-    pub auto_release_delay: u64,
-    pub dispute_reason: Symbol,
-    pub resolved_at: u64,
-    pub usd_amount: i128,
-    pub quoted_token_amount: i128,
-    pub send_asset: Address,
-    pub dest_asset: Address,
-    pub total_sessions: u32,
-    pub sessions_completed: u32,
-}
 
 // ── Contract ─────────────────────────────────────────────────────────────────
 #[contract]
@@ -117,13 +82,13 @@ impl ReputationContract {
             .get(&ESCROW)
             .expect("EscrowContractNotSet");
 
-        let escrow: EscrowInfo = env.invoke_contract(
+        let escrow: EscrowRecord = env.invoke_contract(
             &escrow_addr,
             &Symbol::new(&env, "get_escrow_by_session"),
             (session_id.clone(),).into_val(&env),
         );
 
-        if escrow.status != EscrowStatus::Released {
+        if escrow.status != shared::EscrowStatus::Released {
             panic!("SessionNotReleased");
         }
 
@@ -254,19 +219,19 @@ mod tests {
             env.storage().persistent().set(&session_id, &released);
         }
 
-        pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowInfo {
+        pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowRecord {
             let released: bool = env.storage().persistent().get(&session_id).unwrap_or(false);
             let dummy = Address::generate(&env);
-            EscrowInfo {
+            EscrowRecord {
                 id: 1,
                 mentor: dummy.clone(),
                 learner: dummy.clone(),
                 amount: 100,
                 session_id: session_id.clone(),
                 status: if released {
-                    EscrowStatus::Released
+                    shared::EscrowStatus::Released
                 } else {
-                    EscrowStatus::Active
+                    shared::EscrowStatus::Active
                 },
                 created_at: 0,
                 token_address: dummy.clone(),
