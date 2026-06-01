@@ -702,6 +702,7 @@ mod test {
         }
 
         pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
             let from_bal = Self::balance(env.clone(), from.clone());
             assert!(from_bal >= amount, "Insufficient balance");
             let to_bal = Self::balance(env.clone(), to.clone());
