@@ -34,6 +34,7 @@ pub enum ProposalAction {
 pub enum ProposalStatus {
     Active,
     Passed,
+    Queued,
     Failed,
     Executed,
     Cancelled,
@@ -48,7 +49,8 @@ impl StateMachine for ProposalStatus {
             (ProposalStatus::Active, ProposalStatus::Passed)
                 | (ProposalStatus::Active, ProposalStatus::Failed)
                 | (ProposalStatus::Active, ProposalStatus::Cancelled)
-                | (ProposalStatus::Passed, ProposalStatus::Executed)
+                | (ProposalStatus::Passed, ProposalStatus::Queued)
+                | (ProposalStatus::Queued, ProposalStatus::Executed)
         )
     }
 }
@@ -68,6 +70,7 @@ pub struct Proposal {
     pub total_supply_snapshot: i128,
     pub votes_for: i128,
     pub votes_against: i128,
+    pub timelock_op_id: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -214,6 +217,7 @@ impl GovernanceContract {
             total_supply_snapshot,
             votes_for: 0,
             votes_against: 0,
+            timelock_op_id: None,
         };
 
         env.storage().persistent().set(&PROPOSAL_COUNT, &count);
@@ -291,8 +295,8 @@ impl GovernanceContract {
     pub fn execute_proposal(env: Env, proposal_id: u32) {
         let mut proposal = Self::get_proposal(env.clone(), proposal_id);
 
-        if proposal.status == ProposalStatus::Executed {
-            panic!("proposal already executed");
+        if proposal.status == ProposalStatus::Executed || proposal.status == ProposalStatus::Queued {
+            panic!("proposal already executed or queued");
         }
 
         if env.ledger().timestamp() < proposal.voting_ends_at {
@@ -351,6 +355,58 @@ impl GovernanceContract {
             ),
             (proposal.votes_for, proposal.votes_against, quorum_met),
         );
+
+        // Get timelock contract
+        let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
+        
+        // Use the governance contract address as the caller for the timelock schedule
+        let gov_address = env.current_contract_address();
+
+        // Schedule the action to be executed by the timelock
+        let delay = 48 * 60 * 60; // 48 hours, as per timelock's MIN_DELAY
+        let mut args = Vec::new(&env);
+        args.push_back(proposal_id.into_val(&env));
+        let op_id: BytesN<32> = env.invoke_contract(
+            &timelock,
+            &Symbol::new(&env, "schedule"),
+            (
+                gov_address,
+                gov_address,
+                Symbol::new(&env, "execute_queued_proposal"),
+                args,
+                delay,
+            ).into_val(&env),
+        ).unwrap();
+
+        proposal.timelock_op_id = Some(op_id.clone());
+        proposal.status = ProposalStatus::Queued;
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "governance"),
+                Symbol::new(&env, "proposal_queued"),
+                proposal_id,
+            ),
+            op_id,
+        );
+    }
+
+    /// Execute a queued proposal after timelock delay. Can only be called by the timelock.
+    pub fn execute_queued_proposal(env: Env, proposal_id: u32) {
+        // Check that caller is the timelock
+        let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
+        timelock.require_auth();
+
+        let mut proposal = Self::get_proposal(env.clone(), proposal_id);
+
+        if proposal.status != ProposalStatus::Queued {
+            panic!("proposal not queued");
+        }
+
         Self::apply_action(&env, &proposal.action);
         proposal.status = ProposalStatus::Executed;
         env.storage()
