@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
-    Symbol, Vec,
+    Map, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,9 +18,6 @@ const RBAC: Symbol = symbol_short!("RBAC");
 
 /// Minimum number of independent feeders required before `get_price` returns.
 const MIN_FEEDERS: u32 = 3;
-
-/// Maximum price points kept per asset in the rolling window.
-const MAX_POINTS: u32 = 5;
 
 /// Seconds after which a price is considered stale.
 const STALE_SECS: u64 = 300;
@@ -341,21 +338,18 @@ impl OracleContract {
             }
         }
 
-        // Append to rolling window.
+        // Store the feeder's latest price in the per-asset map (one entry per feeder).
         let key = (symbol_short!("PRICES"), asset.clone());
-        let mut points: Vec<PricePoint> = env
+        let mut price_map: Map<Address, PricePoint> = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(Vec::new(&env));
-        points.push_back(PricePoint { price, timestamp });
-        while points.len() > MAX_POINTS {
-            points.remove(0);
-        }
-        env.storage().persistent().set(&key, &points);
+            .unwrap_or(Map::new(&env));
+        price_map.set(feeder.clone(), PricePoint { price, timestamp });
+        env.storage().persistent().set(&key, &price_map);
 
         // Recompute TWAP.
-        Self::_update_twap(&env, &asset, &points);
+        Self::_update_twap(&env, &asset, &price_map);
 
         env.events().publish(
             (symbol_short!("oracle"), symbol_short!("price_upd"), asset),
@@ -368,7 +362,8 @@ impl OracleContract {
     // -----------------------------------------------------------------------
 
     /// Return the median spot price and the timestamp of the most recent
-    /// submission.  Requires at least MIN_FEEDERS registered feeders.
+    /// submission.  Requires at least MIN_FEEDERS registered feeders and
+    /// at least MIN_FEEDERS distinct feeder submissions for the asset.
     pub fn get_price(env: Env, asset: Symbol) -> (i128, u64) {
         let feeders: Vec<Address> = env
             .storage()
@@ -379,17 +374,19 @@ impl OracleContract {
             panic!("not enough feeders");
         }
         let key = (symbol_short!("PRICES"), asset);
-        let points: Vec<PricePoint> = env
+        let price_map: Map<Address, PricePoint> = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(Vec::new(&env));
-        if points.is_empty() {
-            panic!("no prices");
+            .unwrap_or(Map::new(&env));
+        // Each map entry is keyed by feeder address, so len() == number of
+        // distinct feeders that have submitted for this asset.
+        if price_map.len() < MIN_FEEDERS {
+            panic!("not enough distinct feeder submissions");
         }
         let mut prices = Vec::new(&env);
         let mut last_updated = 0u64;
-        for p in points.iter() {
+        for (_addr, p) in price_map.iter() {
             prices.push_back(p.price);
             if p.timestamp > last_updated {
                 last_updated = p.timestamp;
@@ -581,35 +578,60 @@ impl OracleContract {
 
     fn median(mut values: Vec<i128>) -> i128 {
         let n = values.len();
-        // Bubble sort (small n, no alloc).
-        let mut i = 0;
+        // Insertion sort — n is bounded by the number of registered feeders
+        // (one entry per feeder in the price map), keeping this O(n²) safe.
+        let mut i = 1u32;
         while i < n {
-            let mut j = 0;
-            while j + 1 < n - i {
-                let a = values.get(j).unwrap();
-                let b = values.get(j + 1).unwrap();
-                if a > b {
-                    values.set(j, b);
-                    values.set(j + 1, a);
+            let key = values.get(i).unwrap();
+            let mut j = i;
+            while j > 0 {
+                let prev = values.get(j - 1).unwrap();
+                if prev > key {
+                    values.set(j, prev);
+                    j -= 1;
+                } else {
+                    break;
                 }
-                j += 1;
             }
+            values.set(j, key);
             i += 1;
         }
         values.get(n / 2).unwrap()
     }
 
-    /// Recompute the TWAP from the stored rolling window.
+    /// Recompute the TWAP from each feeder's latest price point.
     ///
     /// TWAP = Σ(price_i × Δt_i) / Σ(Δt_i)
     ///
-    /// Each price point is weighted by the time it was "active" — the gap
-    /// to the next observation.  Requires at least 2 points with distinct
-    /// timestamps.
-    fn _update_twap(env: &Env, asset: &Symbol, points: &Vec<PricePoint>) {
+    /// Points are sorted by timestamp before computing time-weighted intervals.
+    /// Requires at least 2 points with distinct timestamps.
+    fn _update_twap(env: &Env, asset: &Symbol, price_map: &Map<Address, PricePoint>) {
+        // Collect one price point per feeder.
+        let mut points: Vec<PricePoint> = Vec::new(env);
+        for (_k, v) in price_map.iter() {
+            points.push_back(v);
+        }
         let n = points.len();
         if n < 2 {
             return;
+        }
+
+        // Insertion sort by timestamp — bounded by feeder count, so O(n²) is safe.
+        let mut i = 1u32;
+        while i < n {
+            let cur = points.get(i).unwrap();
+            let mut j = i;
+            while j > 0 {
+                let prev = points.get(j - 1).unwrap();
+                if prev.timestamp > cur.timestamp {
+                    points.set(j, prev);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+            points.set(j, cur.clone());
+            i += 1;
         }
 
         let start = if n > TWAP_WINDOW { n - TWAP_WINDOW } else { 0 };
@@ -617,10 +639,10 @@ impl OracleContract {
         let mut cumulative: i128 = 0;
         let mut total_elapsed: u64 = 0;
 
-        let mut i = start;
-        while i + 1 < n {
-            let p0 = points.get(i).unwrap();
-            let p1 = points.get(i + 1).unwrap();
+        let mut idx = start;
+        while idx + 1 < n {
+            let p0 = points.get(idx).unwrap();
+            let p1 = points.get(idx + 1).unwrap();
             if p1.timestamp > p0.timestamp {
                 let dt = (p1.timestamp - p0.timestamp) as i128;
                 cumulative = cumulative
@@ -630,7 +652,7 @@ impl OracleContract {
                     .checked_add(p1.timestamp - p0.timestamp)
                     .unwrap_or(u64::MAX);
             }
-            i += 1;
+            idx += 1;
         }
 
         if total_elapsed == 0 {
