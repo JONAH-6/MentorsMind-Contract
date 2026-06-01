@@ -20,6 +20,7 @@ import { startNetworkMonitor, stopNetworkMonitor, getNetworkStatus } from "./ser
 import { stopStellarMonitor } from "./services/stellar-monitor.service";
 import { startRateRefresh, stopRateRefresh } from "./services/assetExchange.service";
 import { validateAssetConfigAtStartup } from "./services/asset-validation.service";
+import { apiVersioningMiddleware } from "./middleware/api-versioning.middleware";
 
 // Load environment variables
 dotenv.config();
@@ -38,6 +39,7 @@ app.use(
 );
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(apiVersioningMiddleware);
 
 // Routes
 app.use("/api/events", eventIndexerRoutes);

@@ -33,6 +33,11 @@ describe('decodeCursor', () => {
     expect(decodeCursor(cursor)).toBeNull();
   });
 
+  it('returns null when created_at is not strict ISO format', () => {
+    const cursor = encode({ id: VALID_UUID, created_at: '2024-01-01T00:00:00' });
+    expect(decodeCursor(cursor)).toBeNull();
+  });
+
   it('returns null when id field is missing', () => {
     const cursor = encode({ created_at: VALID_DATE });
     expect(decodeCursor(cursor)).toBeNull();
