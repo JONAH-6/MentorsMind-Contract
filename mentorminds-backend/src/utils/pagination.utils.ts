@@ -1,8 +1,14 @@
 /** Maximum allowed cursor string length to prevent oversized payloads. */
 const MAX_CURSOR_LENGTH = 500;
 
+/** Base64 token pattern to reject invalid cursor encodings. */
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
 /** UUID v4 pattern (case-insensitive). */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Strict ISO 8601 UTC date format, matching the encoded cursor output. */
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 export interface DecodedCursor {
   id: string;
@@ -25,20 +31,27 @@ export interface DecodedCursor {
  * @returns Decoded cursor object, or `null` if validation fails.
  */
 export function decodeCursor(cursor: string): DecodedCursor | null {
+  const trimmed = cursor.trim();
+
   // 1. Length check
-  if (cursor.length > MAX_CURSOR_LENGTH) {
+  if (trimmed.length > MAX_CURSOR_LENGTH) {
     return null;
   }
 
-  // 2. Decode base64
+  // 2. Validate base64 encoding strictly before decoding.
+  if (!BASE64_PATTERN.test(trimmed)) {
+    return null;
+  }
+
+  // 3. Decode base64
   let json: string;
   try {
-    json = Buffer.from(cursor, 'base64').toString('utf8');
+    json = Buffer.from(trimmed, 'base64').toString('utf8');
   } catch {
     return null;
   }
 
-  // 3. Parse JSON
+  // 4. Parse JSON
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
@@ -61,8 +74,13 @@ export function decodeCursor(cursor: string): DecodedCursor | null {
     return null;
   }
 
-  // 5. ISO date validation for created_at
-  if (isNaN(Date.parse(obj.created_at))) {
+  // 5. Strict ISO 8601 UTC date validation for created_at
+  if (!ISO_DATE_PATTERN.test(obj.created_at)) {
+    return null;
+  }
+
+  const createdAt = new Date(obj.created_at);
+  if (Number.isNaN(createdAt.getTime()) || createdAt.toISOString() !== obj.created_at) {
     return null;
   }
 
