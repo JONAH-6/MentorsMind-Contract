@@ -129,25 +129,19 @@ impl GovernanceContract {
             panic!("invalid quorum bps");
         }
 
-        env.storage().persistent().set(&ADMIN, &admin);
-        env.storage().persistent().set(&TOKEN, &mnt_token);
-
-        env.storage()
-            .persistent()
-            .set(&SNAPSHOT, &snapshot_contract);
-        env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
-
-        env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
-
-        env.storage().persistent().set(&QUORUM_BPS, &quorum);
-        env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
+        env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&TOKEN, &mnt_token);
+        env.storage().instance().set(&SNAPSHOT, &snapshot_contract);
+        env.storage().instance().set(&VOTING_PERIOD_SECS, &period);
+        env.storage().instance().set(&QUORUM_BPS, &quorum);
+        env.storage().instance().set(&PROPOSAL_COUNT, &0u32);
         env.storage()
             .persistent()
             .set(&DataKey::ArbitratorList, &Vec::<Address>::new(&env));
     }
 
     pub fn set_timelock(env: Env, timelock: Address) {
-        let admin: Address = env.storage().persistent().get(&ADMIN).unwrap();
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
         admin.require_auth();
         env.storage()
             .persistent()
@@ -172,19 +166,19 @@ impl GovernanceContract {
         proposer.require_auth();
         Self::require_initialized(&env);
 
-        let mut count: u32 = env.storage().persistent().get(&PROPOSAL_COUNT).unwrap_or(0);
+        let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
         let now = env.ledger().timestamp();
         let voting_period_secs: u64 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&VOTING_PERIOD_SECS)
             .unwrap_or(DEFAULT_VOTING_PERIOD_SECS);
 
         let snapshot_contract: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
         env.invoke_contract::<()>(
@@ -216,7 +210,7 @@ impl GovernanceContract {
             votes_against: 0,
         };
 
-        env.storage().persistent().set(&PROPOSAL_COUNT, &count);
+        env.storage().instance().set(&PROPOSAL_COUNT, &count);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(count), &proposal);
@@ -245,7 +239,7 @@ impl GovernanceContract {
 
         let snapshot_contract: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
         let weight: i128 = env.invoke_contract(
@@ -306,7 +300,7 @@ impl GovernanceContract {
 
         let quorum_bps: u32 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&QUORUM_BPS)
             .unwrap_or(DEFAULT_QUORUM_BPS);
         let total_votes = proposal
@@ -370,7 +364,7 @@ impl GovernanceContract {
     pub fn cancel_proposal(env: Env, proposal_id: u32) {
         let admin: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&ADMIN)
             .expect("not initialized");
         admin.require_auth();
@@ -522,7 +516,7 @@ impl GovernanceContract {
     }
 
     fn require_initialized(env: &Env) {
-        if !env.storage().persistent().has(&ADMIN) {
+        if !env.storage().instance().has(&ADMIN) {
             panic!("not initialized");
         }
     }
@@ -531,7 +525,7 @@ impl GovernanceContract {
         admin.require_auth();
         let stored: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&ADMIN)
             .expect("not initialized");
         if &stored != admin {
@@ -551,7 +545,7 @@ impl GovernanceContract {
 
     #[allow(dead_code)]
     fn token_address(env: &Env) -> Address {
-        env.storage().persistent().get(&TOKEN).expect("token not set")
+        env.storage().instance().get(&TOKEN).expect("token not set")
     }
 
     #[allow(dead_code)]
