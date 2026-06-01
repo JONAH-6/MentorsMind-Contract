@@ -4,6 +4,7 @@ members = [
     "escrow",
     "contracts/allowance",
     "contracts/bounty",
+    "contracts/escrow_factory",
     "contracts/interface_registry",
     "contracts/verification",
     "contracts/oracle",
@@ -44,6 +45,7 @@ members = [
     "contracts/insurance",
     "contracts/anomaly_detector",
     "contracts/subscription",
+    "contracts/multisig_admin",
 ]
 
 [workspace.package]

@@ -8,6 +8,23 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Add
 const SECONDS_PER_MONTH: u64 = 30 * 24 * 60 * 60; // 30 days
 
 // ---------------------------------------------------------------------------
+// Timestamp security constants
+// ---------------------------------------------------------------------------
+
+/// Grace period applied to the billing-date check in `renew`.
+/// A learner may renew up to RENEWAL_GRACE_SECS *before* `next_billing_date`
+/// to absorb validator timestamp drift (Stellar validators may drift up to
+/// ~30 s).  Using 60 s gives a comfortable margin.
+pub const RENEWAL_GRACE_SECS: u64 = 60; // 1 minute
+
+/// Maximum time after `next_billing_date` that a subscription is still
+/// considered Active before it transitions to Expired.  After this window
+/// the subscription must be explicitly renewed or it is treated as lapsed.
+/// This prevents a subscription from remaining "Active" indefinitely if the
+/// learner never renews.
+pub const SUBSCRIPTION_EXPIRY_GRACE_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -164,7 +181,7 @@ impl SubscriptionContract {
             .set(&DataKey::SubCounter, &(sub_id + 1));
 
         env.events().publish(
-            (symbol_short!("subscribed"), plan_id),
+            (symbol_short!("subscrbd"), plan_id),
             (learner, plan.mentor, sub_id),
         );
 
@@ -172,6 +189,13 @@ impl SubscriptionContract {
     }
 
     /// Renew a subscription — callable by anyone once next_billing_date is reached.
+    ///
+    /// # Timestamp security
+    /// A grace period of `RENEWAL_GRACE_SECS` is applied to the billing-date
+    /// check so that a validator with a slightly slow clock cannot prevent a
+    /// timely renewal.  The subscription must also not have lapsed beyond
+    /// `SUBSCRIPTION_EXPIRY_GRACE_SECS` past the billing date; if it has, the
+    /// subscription is transitioned to `Expired` and renewal is rejected.
     pub fn renew(env: Env, subscription_id: u32) {
         let mut record: SubscriptionRecord = env
             .storage()
@@ -182,7 +206,34 @@ impl SubscriptionContract {
         if record.status != SubscriptionStatus::Active {
             panic!("subscription not active");
         }
-        if env.ledger().timestamp() < record.next_billing_date {
+
+        let now = env.ledger().timestamp();
+
+        // Check whether the subscription has lapsed (past billing date + expiry grace).
+        let expiry_deadline = record
+            .next_billing_date
+            .checked_add(SUBSCRIPTION_EXPIRY_GRACE_SECS)
+            .expect("timestamp overflow");
+        if now >= expiry_deadline {
+            // Transition to Expired and reject renewal — the learner must
+            // create a new subscription.
+            record.status = SubscriptionStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Sub(subscription_id), &record);
+            env.events().publish(
+                (symbol_short!("expired"), subscription_id),
+                (record.learner, record.plan_id),
+            );
+            panic!("subscription expired; create a new subscription");
+        }
+
+        // Apply grace period: allow renewal up to RENEWAL_GRACE_SECS before
+        // the billing date to absorb validator clock drift.
+        let effective_billing_date = record
+            .next_billing_date
+            .saturating_sub(RENEWAL_GRACE_SECS);
+        if now < effective_billing_date {
             panic!("billing date not reached");
         }
 
@@ -266,7 +317,14 @@ impl SubscriptionContract {
         );
     }
 
-    /// Record a session use. Panics if limit exceeded or subscription not active.
+    /// Record a session use. Panics if limit exceeded, subscription not active,
+    /// or the subscription has lapsed past its expiry grace window.
+    ///
+    /// # Timestamp security
+    /// Before recording a session, the subscription's expiry status is checked.
+    /// If the current time has passed `next_billing_date + SUBSCRIPTION_EXPIRY_GRACE_SECS`
+    /// the subscription is transitioned to `Expired` and the session is rejected.
+    /// This prevents sessions from being consumed on a lapsed subscription.
     pub fn use_session(env: Env, subscription_id: u32) {
         let mut record: SubscriptionRecord = env
             .storage()
@@ -276,6 +334,24 @@ impl SubscriptionContract {
 
         if record.status != SubscriptionStatus::Active {
             panic!("subscription not active");
+        }
+
+        // Lazily transition to Expired if the subscription has lapsed.
+        let now = env.ledger().timestamp();
+        let expiry_deadline = record
+            .next_billing_date
+            .checked_add(SUBSCRIPTION_EXPIRY_GRACE_SECS)
+            .expect("timestamp overflow");
+        if now >= expiry_deadline {
+            record.status = SubscriptionStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Sub(subscription_id), &record);
+            env.events().publish(
+                (symbol_short!("expired"), subscription_id),
+                (record.learner, record.plan_id),
+            );
+            panic!("subscription expired");
         }
 
         let plan: Plan = env
@@ -292,6 +368,38 @@ impl SubscriptionContract {
         env.storage()
             .persistent()
             .set(&DataKey::Sub(subscription_id), &record);
+    }
+
+    /// Explicitly check and transition a subscription to Expired if it has
+    /// lapsed.  This is a fallback for off-chain systems that need to
+    /// synchronise state without waiting for a `use_session` or `renew` call.
+    pub fn check_expiry(env: Env, subscription_id: u32) {
+        let mut record: SubscriptionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Sub(subscription_id))
+            .expect("subscription not found");
+
+        if record.status != SubscriptionStatus::Active {
+            return; // Already in a terminal or non-active state
+        }
+
+        let now = env.ledger().timestamp();
+        let expiry_deadline = record
+            .next_billing_date
+            .checked_add(SUBSCRIPTION_EXPIRY_GRACE_SECS)
+            .expect("timestamp overflow");
+
+        if now >= expiry_deadline {
+            record.status = SubscriptionStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Sub(subscription_id), &record);
+            env.events().publish(
+                (symbol_short!("expired"), subscription_id),
+                (record.learner, record.plan_id),
+            );
+        }
     }
 
     /// Get a subscription record by ID.
@@ -378,7 +486,7 @@ mod test {
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
         let sub_id = client.subscribe(&learner, &plan_id);
 
-        // Advance time past billing date
+        // Advance time past billing date (within expiry grace window)
         env.ledger().with_mut(|li| {
             li.timestamp += SECONDS_PER_MONTH + 1;
         });
@@ -393,6 +501,26 @@ mod test {
     }
 
     #[test]
+    fn test_renew_within_grace_period() {
+        // Renewal should succeed up to RENEWAL_GRACE_SECS before billing date.
+        let (env, client, admin, escrow, mentor, learner) = setup();
+        let (token_address, token, token_admin) = create_token(&env, &admin);
+
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Advance to billing_date - RENEWAL_GRACE_SECS (just inside grace window)
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH - RENEWAL_GRACE_SECS;
+        });
+
+        client.renew(&sub_id);
+        assert_eq!(token.balance(&escrow), 200);
+    }
+
+    #[test]
     #[should_panic(expected = "billing date not reached")]
     fn test_renew_too_early_panics() {
         let (env, client, admin, _escrow, mentor, learner) = setup();
@@ -402,7 +530,100 @@ mod test {
         let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
         let sub_id = client.subscribe(&learner, &plan_id);
 
-        // Do NOT advance time — should panic
+        // Do NOT advance time — should panic (well before grace window)
+        client.renew(&sub_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "subscription expired")]
+    fn test_renew_after_expiry_panics() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Advance past billing_date + SUBSCRIPTION_EXPIRY_GRACE_SECS
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + SUBSCRIPTION_EXPIRY_GRACE_SECS + 1;
+        });
+
+        client.renew(&sub_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "subscription expired")]
+    fn test_use_session_after_expiry_panics() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Advance past expiry
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + SUBSCRIPTION_EXPIRY_GRACE_SECS + 1;
+        });
+
+        client.use_session(&sub_id);
+    }
+
+    #[test]
+    fn test_check_expiry_transitions_to_expired() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Advance past expiry
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH + SUBSCRIPTION_EXPIRY_GRACE_SECS + 1;
+        });
+
+        client.check_expiry(&sub_id);
+
+        let record = client.get_subscription(&sub_id);
+        assert_eq!(record.status, SubscriptionStatus::Expired);
+    }
+
+    #[test]
+    fn test_check_expiry_no_op_when_active() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Do not advance time — subscription is still active
+        client.check_expiry(&sub_id);
+
+        let record = client.get_subscription(&sub_id);
+        assert_eq!(record.status, SubscriptionStatus::Active);
+    }
+
+    /// Simulate a validator that skews the clock forward by RENEWAL_GRACE_SECS.
+    /// The subscription must NOT be renewable before the billing date has elapsed.
+    #[test]
+    #[should_panic(expected = "billing date not reached")]
+    fn test_manipulated_timestamp_cannot_renew_early() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin);
+        token_admin.mint(&learner, &1000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        // Validator skews clock forward by RENEWAL_GRACE_SECS - 1.
+        // This is still before the effective billing date.
+        env.ledger().with_mut(|li| {
+            li.timestamp += SECONDS_PER_MONTH - RENEWAL_GRACE_SECS - 1;
+        });
+
         client.renew(&sub_id);
     }
 

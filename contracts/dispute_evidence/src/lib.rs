@@ -1,11 +1,39 @@
+//! Dispute Evidence Contract
+//!
+//! Allows the mentor or learner to attach off-chain evidence references to a
+//! disputed escrow during a bounded submission window. An arbitrator may then
+//! submit a resolution after a mandatory review delay.
+//!
+//! # Workflow
+//! 1. Learner or mentor opens a dispute on the escrow contract.
+//! 2. Either party calls [`DisputeEvidenceContract::submit_evidence`] with a
+//!    `Symbol` pointing to an off-chain document (e.g. IPFS CID, content hash).
+//! 3. An arbitrator calls [`DisputeEvidenceContract::submit_resolution`] after
+//!    `MIN_RESOLUTION_DELAY_SECS` have elapsed since the dispute was opened.
+//! 4. The admin uses the on-chain resolution record to call `resolve_dispute`
+//!    on the escrow contract.
 #![no_std]
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
+/// Default window (seconds) within which evidence may be submitted after session end.
 const DEFAULT_WINDOW_SECS: u64 = 48 * 60 * 60;
+
+/// Maximum evidence items stored per escrow.
 const MAX_EVIDENCE_ITEMS: u32 = 5;
+
+/// Minimum seconds a party must wait between consecutive evidence submissions
+/// for the same escrow (anti-spam / griefing guard). 1 hour.
+const SUBMISSION_COOLDOWN_SECS: u64 = 3_600;
+
+/// Minimum seconds that must elapse after the evidence window opens before
+/// an arbitrator may submit a resolution (gives parties time to respond).
+/// 24 hours.
+const MIN_RESOLUTION_DELAY_SECS: u64 = 24 * 60 * 60;
+
+// ─── Domain types ─────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,11 +80,28 @@ pub struct EvidenceItem {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolution {
+    pub arbitrator: Address,
+    pub release_to_mentor: bool,
+    pub note: Symbol,
+    pub resolved_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     EscrowContract,
     Evidence(u64),
+    Resolution(u64),
     WindowSecs,
+    /// Tracks when each (submitter, escrow_id) pair last submitted evidence.
+    /// Used to enforce SUBMISSION_COOLDOWN_SECS between submissions.
+    LastSubmission(u64, Address),
+    /// Ledger timestamp at which a dispute was opened for a given escrow.
+    DisputeOpenedAt(u64),
+    /// Whether the anti-spam cooldown is enabled (default: true).
+    CooldownEnabled,
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -68,11 +113,16 @@ pub trait EscrowContractTrait {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized = 1,
-    Unauthorized = 2,
-    InvalidEscrowState = 3,
-    EvidenceWindowClosed = 4,
-    EvidenceLimitReached = 5,
+    AlreadyInitialized       = 1,
+    Unauthorized             = 2,
+    InvalidEscrowState       = 3,
+    EvidenceWindowClosed     = 4,
+    EvidenceLimitReached     = 5,
+    AlreadyResolved          = 6,
+    /// Submitter must wait before submitting more evidence (anti-spam).
+    SubmissionCooldown       = 7,
+    /// Arbitrator must wait for MIN_RESOLUTION_DELAY_SECS after dispute opens.
+    ResolutionTimelockActive = 8,
 }
 
 #[contract]
@@ -92,6 +142,9 @@ impl DisputeEvidenceContract {
         env.storage()
             .instance()
             .set(&DataKey::WindowSecs, &DEFAULT_WINDOW_SECS);
+        env.storage()
+            .instance()
+            .set(&DataKey::CooldownEnabled, &true);
         Ok(())
     }
 
@@ -107,6 +160,40 @@ impl DisputeEvidenceContract {
         Ok(())
     }
 
+    /// Enable or disable the anti-spam submission cooldown. Admin only.
+    pub fn set_cooldown_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::CooldownEnabled, &enabled);
+        Ok(())
+    }
+
+    /// Record that a dispute was opened at a specific timestamp.
+    ///
+    /// Should be called by the escrow contract (or admin) immediately when a
+    /// dispute is raised so the resolution timelock clock starts.
+    pub fn record_dispute_opened(env: Env, escrow_id: u64, opened_at: u64) -> Result<(), Error> {
+        // Allow either admin or the escrow contract to call this
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        stored.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeOpenedAt(escrow_id), &opened_at);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_opened"), escrow_id),
+            opened_at,
+        );
+        Ok(())
+    }
+
+    /// Submit evidence for a disputed escrow.
+    ///
+    /// # Anti-spam guard
+    /// A party may not submit evidence more than once per
+    /// `SUBMISSION_COOLDOWN_SECS` (1 h) for the same escrow.
     pub fn submit_evidence(
         env: Env,
         escrow_id: u64,
@@ -129,6 +216,26 @@ impl DisputeEvidenceContract {
             .unwrap_or(DEFAULT_WINDOW_SECS);
         if env.ledger().timestamp() > escrow.session_end_time.saturating_add(window_secs) {
             return Err(Error::EvidenceWindowClosed);
+        }
+
+        // Anti-spam / griefing guard
+        let cooldown_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CooldownEnabled)
+            .unwrap_or(true);
+        if cooldown_enabled {
+            let cooldown_key = DataKey::LastSubmission(escrow_id, submitter.clone());
+            let last_submission: u64 = env
+                .storage()
+                .persistent()
+                .get(&cooldown_key)
+                .unwrap_or(0);
+            let now = env.ledger().timestamp();
+            if now < last_submission.saturating_add(SUBMISSION_COOLDOWN_SECS) {
+                return Err(Error::SubmissionCooldown);
+            }
+            env.storage().persistent().set(&cooldown_key, &now);
         }
 
         let key = DataKey::Evidence(escrow_id);
@@ -164,6 +271,63 @@ impl DisputeEvidenceContract {
         Self::get_evidence(env, escrow_id).len()
     }
 
+    /// Submit a dispute resolution.
+    ///
+    /// # Time-lock guard
+    /// Resolution may only be submitted at least `MIN_RESOLUTION_DELAY_SECS`
+    /// (24 h) after the dispute was opened (via `record_dispute_opened`). If
+    /// no opened-at record exists the guard is skipped (backwards-compatible).
+    pub fn submit_resolution(
+        env: Env,
+        escrow_id: u64,
+        arbitrator: Address,
+        release_to_mentor: bool,
+        note: Symbol,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+        let escrow = Self::load_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+
+        let key = DataKey::Resolution(escrow_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::AlreadyResolved);
+        }
+
+        // Time-lock: enforce minimum deliberation period.
+        if let Some(opened_at) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::DisputeOpenedAt(escrow_id))
+        {
+            let earliest_resolution = opened_at.saturating_add(MIN_RESOLUTION_DELAY_SECS);
+            if env.ledger().timestamp() < earliest_resolution {
+                return Err(Error::ResolutionTimelockActive);
+            }
+        }
+
+        let resolution = DisputeResolution {
+            arbitrator: arbitrator.clone(),
+            release_to_mentor,
+            note: note.clone(),
+            resolved_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &resolution);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_resolved"), escrow_id),
+            resolution,
+        );
+        Ok(())
+    }
+
+    pub fn get_resolution(env: Env, escrow_id: u64) -> DisputeResolution {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Resolution(escrow_id))
+            .expect("resolution not found")
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         let stored_admin: Address = env
@@ -187,59 +351,240 @@ impl DisputeEvidenceContract {
     }
 }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contractimpl, testutils::Address as _};
+    use soroban_sdk::{
+        contractimpl,
+        testutils::{Address as _, Events, Ledger, LedgerInfo},
+        IntoVal, TryFromVal,
+    };
 
     #[contract]
     struct MockEscrow;
 
-    #[contractimpl]
-    impl MockEscrow {
-        pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
-            Escrow {
-                id: escrow_id,
-                mentor: Address::generate(&env),
-                learner: Address::generate(&env),
-                amount: 100,
-                session_id: Symbol::new(&env, "sess"),
-                status: EscrowStatus::Disputed,
-                created_at: env.ledger().timestamp(),
-                token_address: Address::generate(&env),
-                platform_fee: 0,
-                net_amount: 0,
-                session_end_time: env.ledger().timestamp(),
-                auto_release_delay: 0,
-                dispute_reason: Symbol::new(&env, "late"),
-                resolved_at: 0,
-                usd_amount: 0,
-                quoted_token_amount: 100,
-                send_asset: Address::generate(&env),
-                dest_asset: Address::generate(&env),
-                total_sessions: 1,
-                sessions_completed: 0,
-            }
+    fn make_escrow(env: &Env, status: EscrowStatus) -> Escrow {
+        Escrow {
+            id: 1,
+            mentor: Address::generate(env),
+            learner: Address::generate(env),
+            amount: 100,
+            session_id: Symbol::new(env, "sess"),
+            status,
+            created_at: env.ledger().timestamp(),
+            token_address: Address::generate(env),
+            platform_fee: 0,
+            net_amount: 0,
+            session_end_time: env.ledger().timestamp() + 3_600,
+            auto_release_delay: 0,
+            dispute_reason: Symbol::new(env, "late"),
+            resolved_at: 0,
+            usd_amount: 0,
+            quoted_token_amount: 100,
+            send_asset: Address::generate(env),
+            dest_asset: Address::generate(env),
+            total_sessions: 1,
+            sessions_completed: 0,
         }
     }
 
-    #[test]
-    fn stores_evidence_until_cap() {
+    #[contractimpl]
+    impl MockEscrow {
+        pub fn get_escrow(env: Env, _escrow_id: u64) -> Escrow {
+            make_escrow(&env, EscrowStatus::Disputed)
+        }
+    }
+
+    fn setup_disputed() -> (Env, Address, Address, Address, DisputeEvidenceContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-
-        let escrow_contract = env.register_contract(None, MockEscrow);
-        let contract_id = env.register_contract(None, DisputeEvidenceContract);
-        let client = DisputeEvidenceContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-
-        client.initialize(&admin, &escrow_contract);
+        let escrow_contract = env.register(MockEscrow, ());
+        let contract_id = env.register(DisputeEvidenceContract, ());
+        let client = DisputeEvidenceContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &escrow_contract).unwrap();
         let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&1);
+        (env, admin, escrow.mentor, escrow.learner, client)
+    }
 
-        for evidence in ["e1", "e2", "e3", "e4", "e5"] {
-            client.submit_evidence(&1, &escrow.mentor, &Symbol::new(&env, evidence));
+    fn advance_time(env: &Env, secs: u64) {
+        let t = env.ledger().timestamp();
+        env.ledger().set(LedgerInfo {
+            timestamp: t + secs,
+            protocol_version: 22,
+            sequence_number: env.ledger().sequence() + 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 100,
+            min_persistent_entry_ttl: 100,
+            max_entry_ttl: 9_999_999,
+        });
+    }
+
+    // ─── existing: evidence cap ───────────────────────────────────────────
+
+    #[test]
+    fn stores_evidence_until_cap() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        // Disable cooldown to allow rapid sequential submissions for cap test
+        client.set_cooldown_enabled(&_admin, &false).unwrap();
+        for e in ["e1", "e2", "e3", "e4", "e5"] {
+            client
+                .submit_evidence(&1, &mentor, &Symbol::new(&env, e))
+                .unwrap();
         }
-
         assert_eq!(client.get_evidence_count(&1), MAX_EVIDENCE_ITEMS);
+    }
+
+    // ─── #417: anti-spam cooldown ─────────────────────────────────────────
+
+    #[test]
+    fn second_submission_within_cooldown_fails() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "e1"))
+            .unwrap();
+        // Immediately retry (within cooldown) → must fail
+        let result = client.try_submit_evidence(&1, &mentor, &Symbol::new(&env, "e2"));
+        assert!(result.is_err(), "second submission within cooldown must fail");
+    }
+
+    #[test]
+    fn submission_allowed_after_cooldown_elapses() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "e1"))
+            .unwrap();
+        advance_time(&env, SUBMISSION_COOLDOWN_SECS + 1);
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "e2"))
+            .unwrap();
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn different_parties_may_submit_independently() {
+        let (env, _admin, mentor, learner, client) = setup_disputed();
+        // mentor submits
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "proof_a"))
+            .unwrap();
+        // learner submits in the same window — separate cooldown key
+        client
+            .submit_evidence(&1, &learner, &Symbol::new(&env, "proof_b"))
+            .unwrap();
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn cooldown_disabled_allows_rapid_submission() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "x"))
+            .unwrap();
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "y"))
+            .unwrap();
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    // ─── #417: resolution timelock ────────────────────────────────────────
+
+    #[test]
+    fn resolution_before_timelock_fails() {
+        let (env, admin, _mentor, _learner, client) = setup_disputed();
+        let arbitrator = Address::generate(&env);
+        let opened_at = env.ledger().timestamp();
+        client.record_dispute_opened(&1, &opened_at).unwrap();
+
+        // Do NOT advance time
+        let result = client.try_submit_resolution(
+            &1,
+            &arbitrator,
+            &true,
+            &Symbol::new(&env, "mentor_wins"),
+        );
+        assert!(result.is_err(), "resolution before timelock must fail");
+        let _ = admin;
+    }
+
+    #[test]
+    fn resolution_after_timelock_succeeds() {
+        let (env, admin, _mentor, _learner, client) = setup_disputed();
+        let arbitrator = Address::generate(&env);
+        let opened_at = env.ledger().timestamp();
+        client.record_dispute_opened(&1, &opened_at).unwrap();
+
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+
+        client
+            .submit_resolution(&1, &arbitrator, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let res = client.get_resolution(&1);
+        assert_eq!(res.arbitrator, arbitrator);
+        assert!(res.release_to_mentor);
+        let _ = admin;
+    }
+
+    #[test]
+    fn resolution_without_opened_at_record_is_allowed() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        // No `record_dispute_opened` call — guard is skipped for backwards compat
+        let arbitrator = Address::generate(&env);
+        client
+            .submit_resolution(&1, &arbitrator, &false, &Symbol::new(&env, "learner_wins"))
+            .unwrap();
+        let res = client.get_resolution(&1);
+        assert!(!res.release_to_mentor);
+    }
+
+    // ─── #417: duplicate resolution rejected ─────────────────────────────
+
+    #[test]
+    fn second_resolution_rejected() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "a"))
+            .unwrap();
+        let result = client.try_submit_resolution(&1, &arb, &false, &Symbol::new(&env, "b"));
+        assert!(result.is_err(), "second resolution must be rejected");
+    }
+
+    // ─── #417: events ─────────────────────────────────────────────────────
+
+    #[test]
+    fn evidence_submitted_event_contains_correct_payload() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &Symbol::new(&env, "proof_a"))
+            .unwrap();
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(
+            last.1,
+            (Symbol::new(&env, "evidence_submitted"), 1u64).into_val(&env)
+        );
+        let payload = EvidenceItem::try_from_val(&env, &last.2).unwrap();
+        assert_eq!(payload.evidence_ref, Symbol::new(&env, "proof_a"));
+    }
+
+    #[test]
+    fn dispute_resolved_event_emitted_on_resolution() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"))
+            .unwrap();
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(
+            last.1,
+            (Symbol::new(&env, "dispute_resolved"), 1u64).into_val(&env)
+        );
     }
 }

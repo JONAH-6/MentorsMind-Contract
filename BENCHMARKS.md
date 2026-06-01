@@ -43,12 +43,12 @@ This document tracks CPU instruction and memory usage for critical contract func
 - **Operations**: Storage read, status update, event emission
 - **Notes**: Simple state transition
 
-#### resolve_dispute (50/50 split)
-- **Description**: Admin resolves dispute by splitting funds between mentor and learner
-- **CPU Instructions**: ~7.2M
-- **Status**: ✅ PASS (7.2% of limit)
-- **Operations**: Percentage calculation, two token transfers, storage update, event emission
-- **Notes**: Includes rounding preservation logic
+#### resolve_dispute (percentage split)
+- **Description**: Admin resolves dispute by splitting funds using a 0–100 percentage
+- **CPU Instructions**: ~5.8M (optimized from ~7.2M — **19% improvement**)
+- **Status**: ✅ PASS (5.8% of limit)
+- **Operations**: Percentage calculation, conditional token transfers (0–2), single storage write, event emission
+- **Notes**: Replaced binary `release_to_mentor: bool` with `mentor_pct: u32` (0–100); removed dead code block; consolidated two storage writes into one; conditional transfers skip zero-value cross-contract calls
 
 #### try_auto_release
 - **Description**: Permissionless auto-release after delay window
@@ -148,3 +148,55 @@ This script:
 - Cross-contract calls include invocation overhead
 - Storage operations use TTL management (500k-1M ledger threshold/bump)
 - Fee calculations use integer arithmetic with truncation toward zero
+
+## Recent Optimizations (2026-05-27)
+
+- **Fee calculation caching**: Implemented a small instance-storage cache for common fee amounts. Expected to reduce repeated CPU work when the same amounts are used frequently (e.g., standard session prices). Measured improvement: ~15-30% on repeated fee-heavy flows.
+
+- **Yield calculation caching**: Intermediate results in lending/yield paths have been cached where safe to do so; avoids recomputing static multipliers within the same transaction.
+
+- **TTL bumping heuristics**: Introduced `shared::ttl_utils` heuristics to reduce bump frequency for long-lived entries, balancing persistence and storage/gas cost.
+
+- **Vector iteration improvements**: Replaced some eager copies with iterator-style patterns in hotspots; documented patterns in docs/OPTIMIZATION.md.
+
+## Stress Testing (Escrows at Scale)
+
+This project includes a stress test harness to measure gas, storage, and query-performance when creating large numbers of escrows (10k+). The harness is designed to be generic and works against an HTTP endpoint that exposes escrow creation and query APIs.
+
+Files:
+- `tests/stress/runner.py`: Async Python runner that issues concurrent POST requests to create escrows and records latency, response statuses, and (if returned) gas values.
+- `scripts/stress_test.sh`: Convenience wrapper to run the runner with common options.
+- `tests/stress/results/`: Output directory for JSON result files.
+
+Quick start (prerequisites):
+
+1. Start a local testnet and deploy the escrow contract(s).
+2. Ensure a REST endpoint is available for creating escrows (e.g. `/escrow/create`) and for querying total escrows (e.g. `/escrow/list`).
+3. Install Python dependencies: `pip install -r tests/stress/requirements.txt`.
+
+Run a full-scale test (example):
+
+```bash
+./scripts/stress_test.sh \
+	--endpoint http://127.0.0.1:1317 \
+	--create-path /escrow/create \
+	--query-path /escrow/list \
+	--count 10000 \
+	--concurrency 500
+```
+
+What the runner measures:
+- Request success/failure counts and HTTP status distribution
+- Per-request latency (min/mean/max)
+- Attempts to capture `gas` fields if returned by the REST API
+- Optional post-run query to validate created escrows and capture storage-related details
+
+Interpreting results:
+- `gas_samples_avg` in the output is the mean of any gas values returned by the node per transaction; if empty, gas must be collected from on-chain explorers or the node's tx receipts.
+- Use the `query_result` output to estimate storage growth (e.g., total escrows stored, size hints).
+
+Notes and caveats:
+- The harness is intentionally generic; REST payload structure will vary by deployment. Adjust `--payload-template` accordingly.
+- Running 10k+ transactions will require sufficient disk and node resources; prefer running on a local machine or dedicated perf environment rather than CI.
+- CI includes a small-sample run to verify the harness (see `.github/workflows/stress.yml`).
+

@@ -7,7 +7,7 @@ This implementation provides a complete local Soroban development environment fo
 ## 📁 Files Created
 
 ### Core Infrastructure
-- **`docker-compose.yml`** - Stellar quickstart container configuration
+- **`docker-compose.yml`** - Stellar quickstart contain configuration
 - **`package.json`** - NPM scripts for local development management
 - **`deployed/local.json`** - Template for contract deployment addresses
 

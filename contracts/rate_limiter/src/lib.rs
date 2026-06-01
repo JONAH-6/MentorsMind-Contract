@@ -96,6 +96,8 @@ impl RateLimiterContract {
 
         // Check if we need to reset the window
         if now >= window_start + window_seconds_u64 {
+            // Reset the counter and window timestamp together so the TTL always
+            // reflects the active policy window rather than the previous one.
             // New window - reset counter
             env.storage().temporary().set(&window_start_key, &now);
             env.storage().temporary().set(&call_count_key, &1u32);
@@ -115,6 +117,8 @@ impl RateLimiterContract {
         let current_count: u32 = env.storage().temporary().get(&call_count_key).unwrap_or(0);
 
         if current_count >= max_calls {
+            // Emit a dedicated event so operators can tell policy enforcement
+            // apart from genuine execution failures in downstream logs.
             // Rate limit exceeded - emit event
             env.events().publish(
                 (
@@ -131,7 +135,8 @@ impl RateLimiterContract {
         let new_count = current_count + 1;
         env.storage().temporary().set(&call_count_key, &new_count);
 
-        // Extend TTL
+        // Extend TTL only for the remaining time in the window so the counter
+        // expires with the policy interval.
         let remaining_seconds = (window_start + window_seconds_u64 - now) as u32;
         env.storage()
             .temporary()

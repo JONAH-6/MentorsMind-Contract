@@ -240,6 +240,58 @@ impl ReferralContract {
             .get(&DataKey::Admin)
             .expect("Not initialized")
     }
+
+    /// Distribute a portion of platform fees as referral rewards.
+    /// `reward_bps` basis points of `platform_fee` are added to the referrer's
+    /// pending rewards. Admin only.
+    pub fn distribute_from_fee(
+        env: Env,
+        referrer: Address,
+        platform_fee: i128,
+        reward_bps: u32,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if platform_fee <= 0 || reward_bps == 0 {
+            return;
+        }
+
+        // Multiply first to preserve precision, then divide — matching the
+        // escrow fee formula so referral rewards are computed consistently.
+        let reward = platform_fee
+            .checked_mul(reward_bps as i128)
+            .expect("overflow")
+            .checked_div(10_000)
+            .expect("division error");
+
+        if reward <= 0 {
+            return;
+        }
+
+        let mut pending: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingReward(referrer.clone()))
+            .unwrap_or(0);
+        pending = pending.checked_add(reward).expect("overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingReward(referrer.clone()), &pending);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "Referral"),
+                Symbol::new(&env, "FeeReward"),
+                referrer,
+            ),
+            (reward,),
+        );
+    }
 }
 
 #[cfg(test)]
