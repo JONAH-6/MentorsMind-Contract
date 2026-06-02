@@ -110,6 +110,14 @@ pub struct GovernanceContract;
 
 #[contractimpl]
 impl GovernanceContract {
+    fn transition_proposal_status(env: &Env, proposal: &mut Proposal, to: ProposalStatus) {
+        let from = proposal.status.clone();
+        if !ProposalStatus::is_valid_transition(env, &from, &to) {
+            panic!("invalid proposal status transition");
+        }
+        proposal.status = to;
+    }
+
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -138,8 +146,6 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&SNAPSHOT, &snapshot_contract);
-        env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
-
         env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
@@ -175,7 +181,11 @@ impl GovernanceContract {
         proposer.require_auth();
         Self::require_initialized(&env);
 
-        let mut count: u32 = env.storage().persistent().get(&PROPOSAL_COUNT).unwrap_or(0);
+        let mut count: u32 = env
+            .storage()
+            .persistent()
+            .get(&PROPOSAL_COUNT)
+            .unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
         let now = env.ledger().timestamp();
@@ -331,7 +341,7 @@ impl GovernanceContract {
         let passed = quorum_met && proposal.votes_for > proposal.votes_against;
 
         if !passed {
-            proposal.status = ProposalStatus::Failed;
+            Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Failed);
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -346,7 +356,7 @@ impl GovernanceContract {
             return;
         }
 
-        proposal.status = ProposalStatus::Passed;
+        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Passed);
         env.events().publish(
             (
                 Symbol::new(&env, "governance"),
@@ -379,7 +389,7 @@ impl GovernanceContract {
         ).unwrap();
 
         proposal.timelock_op_id = Some(op_id.clone());
-        proposal.status = ProposalStatus::Queued;
+        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Queued);
         
         env.storage()
             .persistent()
@@ -408,7 +418,7 @@ impl GovernanceContract {
         }
 
         Self::apply_action(&env, &proposal.action);
-        proposal.status = ProposalStatus::Executed;
+        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Executed);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -432,8 +442,12 @@ impl GovernanceContract {
         admin.require_auth();
 
         let mut proposal = Self::get_proposal(env.clone(), proposal_id);
-        if proposal.status == ProposalStatus::Executed {
-            panic!("cannot cancel executed proposal");
+
+        match proposal.status {
+            ProposalStatus::Executed => panic!("cannot cancel executed proposal"),
+            ProposalStatus::Failed => panic!("cannot cancel failed proposal"),
+            ProposalStatus::Cancelled => panic!("proposal already cancelled"),
+            _ => {}
         }
 
         proposal.status = ProposalStatus::Cancelled;
@@ -876,4 +890,99 @@ mod tests {
         let selected = gov.select_arbitrator(&7u64);
         assert!(selected == a1 || selected == a2);
     }
+
+    #[test]
+    #[should_panic(expected = "cannot cancel failed proposal")]
+    fn test_cancel_failed_proposal_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        // Make quorum fail => proposal transitions to Failed
+        token.set_total_supply(&10_000i128);
+        token.set_balance(&voter, &50i128);
+
+        let title = Bytes::from_slice(&env, b"Raise delay");
+        let description_hash = BytesN::from_array(&env, &[9u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateAutoRelease(86_400),
+        );
+
+        gov.vote(&voter, &proposal_id, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Failed);
+
+        // Now cancel should panic
+        gov.cancel_proposal(&proposal_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal already cancelled")]
+    fn test_cancel_cancelled_proposal_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let proposer = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        // Token values aren't used for cancellation of an Active proposal.
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&proposer, &200i128);
+
+        let title = Bytes::from_slice(&env, b"Update fee");
+        let description_hash = BytesN::from_array(&env, &[10u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &proposer,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(300),
+        );
+
+        // First cancel succeeds
+        gov.cancel_proposal(&proposal_id);
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+        // Second cancel panics
+        gov.cancel_proposal(&proposal_id);
+    }
 }
+

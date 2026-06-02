@@ -23,7 +23,6 @@ pub struct RouterConfig {
     pub admin: Address,
     pub escrow_contract: Address,
     pub bridge_receiver: Address,
-    pub supported_chains: Vec<u32>,
     /// Optional oracle contract address.  When set, cross-chain payments are
     /// validated against the oracle's TWAP before being routed.
     pub oracle_contract: Option<Address>,
@@ -73,6 +72,7 @@ pub enum DataKey {
     Treasury,
     Timelock,
     Multisig,
+    SupportedChains,
 }
 
 #[contract]
@@ -97,11 +97,11 @@ impl PaymentRouter {
             admin: admin.clone(),
             escrow_contract,
             bridge_receiver,
-            supported_chains,
             oracle_contract: None,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::SupportedChains, &supported_chains);
         env.storage()
             .instance()
             .set(&DataKey::EscrowIdCounter, &0u64);
@@ -366,8 +366,10 @@ impl PaymentRouter {
 
     /// Get the list of supported chains
     pub fn get_supported_chains(env: Env) -> Vec<u32> {
-        let config = Self::get_config(env.clone());
-        config.supported_chains
+        env.storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Add a supported chain (admin only)
@@ -375,15 +377,20 @@ impl PaymentRouter {
         let config = Self::get_config(env.clone());
         config.admin.require_auth();
 
+        let mut supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env));
+
         // Check if chain already exists
-        let exists = config.supported_chains.iter().any(|c| c == chain_id);
+        let exists = supported_chains.iter().any(|c| c == chain_id);
         if exists {
             panic!("Chain already supported");
         }
 
-        let mut new_config = config;
-        new_config.supported_chains.push_back(chain_id);
-        env.storage().instance().set(&DataKey::Config, &new_config);
+        supported_chains.push_back(chain_id);
+        env.storage().instance().set(&DataKey::SupportedChains, &supported_chains);
     }
 
     /// Remove a supported chain (admin only)
@@ -396,16 +403,20 @@ impl PaymentRouter {
             panic!("Cannot remove Stellar native chain");
         }
 
+        let supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env));
+
         let mut new_chains = Vec::new(&env);
-        for chain in config.supported_chains.iter() {
+        for chain in supported_chains.iter() {
             if chain != chain_id {
                 new_chains.push_back(chain);
             }
         }
 
-        let mut new_config = config;
-        new_config.supported_chains = new_chains;
-        env.storage().instance().set(&DataKey::Config, &new_config);
+        env.storage().instance().set(&DataKey::SupportedChains, &new_chains);
     }
 
     /// Update timelock contract address (admin only)
@@ -561,10 +572,14 @@ impl PaymentRouter {
         _token: &Address,
     ) {
         let config = Self::get_config(env.clone());
+        let supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(env));
 
         // Check if source chain is supported
-        let is_supported = config
-            .supported_chains
+        let is_supported = supported_chains
             .iter()
             .any(|chain| chain == source_chain);
         if !is_supported {
@@ -780,6 +795,7 @@ mod test {
         }
 
         pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
             let from_bal = Self::balance(env.clone(), from.clone());
             assert!(from_bal >= amount, "Insufficient balance");
             let to_bal = Self::balance(env.clone(), to.clone());
