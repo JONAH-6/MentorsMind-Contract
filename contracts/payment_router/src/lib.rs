@@ -23,7 +23,6 @@ pub struct RouterConfig {
     pub admin: Address,
     pub escrow_contract: Address,
     pub bridge_receiver: Address,
-    pub supported_chains: Vec<u32>,
     /// Optional oracle contract address.  When set, cross-chain payments are
     /// validated against the oracle's TWAP before being routed.
     pub oracle_contract: Option<Address>,
@@ -71,6 +70,9 @@ pub enum DataKey {
     ApprovedToken(Address),
     FeeBps,
     Treasury,
+    Timelock,
+    Multisig,
+    SupportedChains,
 }
 
 #[contract]
@@ -95,11 +97,11 @@ impl PaymentRouter {
             admin: admin.clone(),
             escrow_contract,
             bridge_receiver,
-            supported_chains,
             oracle_contract: None,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::SupportedChains, &supported_chains);
         env.storage()
             .instance()
             .set(&DataKey::EscrowIdCounter, &0u64);
@@ -364,8 +366,10 @@ impl PaymentRouter {
 
     /// Get the list of supported chains
     pub fn get_supported_chains(env: Env) -> Vec<u32> {
-        let config = Self::get_config(env.clone());
-        config.supported_chains
+        env.storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Add a supported chain (admin only)
@@ -373,15 +377,20 @@ impl PaymentRouter {
         let config = Self::get_config(env.clone());
         config.admin.require_auth();
 
+        let mut supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env));
+
         // Check if chain already exists
-        let exists = config.supported_chains.iter().any(|c| c == chain_id);
+        let exists = supported_chains.iter().any(|c| c == chain_id);
         if exists {
             panic!("Chain already supported");
         }
 
-        let mut new_config = config;
-        new_config.supported_chains.push_back(chain_id);
-        env.storage().instance().set(&DataKey::Config, &new_config);
+        supported_chains.push_back(chain_id);
+        env.storage().instance().set(&DataKey::SupportedChains, &supported_chains);
     }
 
     /// Remove a supported chain (admin only)
@@ -394,36 +403,116 @@ impl PaymentRouter {
             panic!("Cannot remove Stellar native chain");
         }
 
+        let supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(&env));
+
         let mut new_chains = Vec::new(&env);
-        for chain in config.supported_chains.iter() {
+        for chain in supported_chains.iter() {
             if chain != chain_id {
                 new_chains.push_back(chain);
             }
         }
 
-        let mut new_config = config;
-        new_config.supported_chains = new_chains;
-        env.storage().instance().set(&DataKey::Config, &new_config);
+        env.storage().instance().set(&DataKey::SupportedChains, &new_chains);
     }
 
-    /// Update escrow contract address (admin only)
+    /// Update timelock contract address (admin only)
+    pub fn set_timelock(env: Env, timelock: Address) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::Timelock, &timelock);
+    }
+
+    /// Update multisig contract address (admin only)
+    pub fn set_multisig(env: Env, multisig: Address) {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::Multisig, &multisig);
+    }
+
+    /// Schedule an update to the escrow contract
+    pub fn schedule_escrow_contract(env: Env, new_escrow: Address) {
+        let multisig: Address = env.storage().instance().get(&DataKey::Multisig).expect("Multisig not set");
+        multisig.require_auth();
+
+        let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
+
+        let mut args = Vec::new(&env);
+        args.push_back(new_escrow.into_val(&env));
+
+        env.invoke_contract::<BytesN<32>>(
+            &timelock,
+            &Symbol::new(&env, "schedule"),
+            (
+                env.current_contract_address(), // proposer
+                env.current_contract_address(), // target
+                Symbol::new(&env, "set_escrow_contract"), // function
+                args,
+                48u64 * 60 * 60, // 48 hours delay
+            ).into_val(&env)
+        );
+    }
+    
+    /// Schedule an update to the bridge receiver
+    pub fn schedule_bridge_receiver(env: Env, new_bridge: Address) {
+        let multisig: Address = env.storage().instance().get(&DataKey::Multisig).expect("Multisig not set");
+        multisig.require_auth();
+
+        let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
+
+        let mut args = Vec::new(&env);
+        args.push_back(new_bridge.into_val(&env));
+
+        env.invoke_contract::<BytesN<32>>(
+            &timelock,
+            &Symbol::new(&env, "schedule"),
+            (
+                env.current_contract_address(),
+                env.current_contract_address(),
+                Symbol::new(&env, "set_bridge_receiver"),
+                args,
+                48u64 * 60 * 60,
+            ).into_val(&env)
+        );
+    }
+
+    /// Update escrow contract address (timelock only)
     pub fn set_escrow_contract(env: Env, escrow_contract: Address) {
+        let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
+        timelock.require_auth();
+
         let config = Self::get_config(env.clone());
-        config.admin.require_auth();
+        let old_escrow = config.escrow_contract.clone();
 
         let mut new_config = config;
-        new_config.escrow_contract = escrow_contract;
+        new_config.escrow_contract = escrow_contract.clone();
         env.storage().instance().set(&DataKey::Config, &new_config);
+
+        env.events().publish(
+            (symbol_short!("router"), symbol_short!("escr_set")),
+            (old_escrow, escrow_contract)
+        );
     }
 
-    /// Update bridge receiver address (admin only)
+    /// Update bridge receiver address (timelock only)
     pub fn set_bridge_receiver(env: Env, bridge_receiver: Address) {
+        let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
+        timelock.require_auth();
+
         let config = Self::get_config(env.clone());
-        config.admin.require_auth();
+        let old_bridge = config.bridge_receiver.clone();
 
         let mut new_config = config;
-        new_config.bridge_receiver = bridge_receiver;
+        new_config.bridge_receiver = bridge_receiver.clone();
         env.storage().instance().set(&DataKey::Config, &new_config);
+
+        env.events().publish(
+            (symbol_short!("router"), symbol_short!("brdg_set")),
+            (old_bridge, bridge_receiver)
+        );
     }
 
     /// Set or update the oracle contract address (admin only).
@@ -483,10 +572,14 @@ impl PaymentRouter {
         _token: &Address,
     ) {
         let config = Self::get_config(env.clone());
+        let supported_chains: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupportedChains)
+            .unwrap_or(Vec::new(env));
 
         // Check if source chain is supported
-        let is_supported = config
-            .supported_chains
+        let is_supported = supported_chains
             .iter()
             .any(|chain| chain == source_chain);
         if !is_supported {
@@ -925,9 +1018,11 @@ mod test {
         let env = Env::default();
         let (admin, escrow_contract, bridge_receiver, _, client) = setup_env(&env);
         let new_escrow = Address::generate(&env);
+        let timelock = Address::generate(&env);
         env.mock_all_auths();
 
         client.init(&admin, &escrow_contract, &bridge_receiver);
+        client.set_timelock(&timelock);
         client.set_escrow_contract(&new_escrow);
 
         let config = client.get_config();
@@ -939,9 +1034,11 @@ mod test {
         let env = Env::default();
         let (admin, escrow_contract, bridge_receiver, _, client) = setup_env(&env);
         let new_bridge = Address::generate(&env);
+        let timelock = Address::generate(&env);
         env.mock_all_auths();
 
         client.init(&admin, &escrow_contract, &bridge_receiver);
+        client.set_timelock(&timelock);
         client.set_bridge_receiver(&new_bridge);
 
         let config = client.get_config();

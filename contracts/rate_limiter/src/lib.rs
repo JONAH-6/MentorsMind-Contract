@@ -72,6 +72,7 @@ impl RateLimiterContract {
         max_calls: u32,
         window_seconds: u32,
     ) -> bool {
+        caller.require_auth();
         // Check if caller is whitelisted
         if env
             .storage()
@@ -95,7 +96,7 @@ impl RateLimiterContract {
         let window_seconds_u64 = window_seconds as u64;
 
         // Check if we need to reset the window
-        if now >= window_start + window_seconds_u64 {
+        if now >= window_start.saturating_add(window_seconds_u64) {
             // Reset the counter and window timestamp together so the TTL always
             // reflects the active policy window rather than the previous one.
             // New window - reset counter
@@ -137,7 +138,8 @@ impl RateLimiterContract {
 
         // Extend TTL only for the remaining time in the window so the counter
         // expires with the policy interval.
-        let remaining_seconds = (window_start + window_seconds_u64 - now) as u32;
+        let remaining_u64 = window_start.saturating_add(window_seconds_u64).saturating_sub(now);
+        let remaining_seconds = remaining_u64.min(u32::MAX as u64) as u32;
         env.storage()
             .temporary()
             .extend_ttl(&call_count_key, remaining_seconds, remaining_seconds);
