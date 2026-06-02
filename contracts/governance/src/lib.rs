@@ -148,8 +148,6 @@ impl GovernanceContract {
             .set(&SNAPSHOT, &snapshot_contract);
         env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
-        env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
-
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
         env.storage()
