@@ -18,6 +18,7 @@ const CURRENT_AUTO_RELEASE_SECS: Symbol = symbol_short!("AUTO_REL");
 
 const DEFAULT_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUORUM_BPS: u32 = 1_000; // 10%
+const EXECUTE_CALL_TIMELOCK_SECS: u64 = 7 * 24 * 60 * 60; // 7-day mandatory delay
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,7 +27,7 @@ pub enum ProposalAction {
     UpdateAutoRelease(u64),
     AddAsset(Address),
     UpdateAdmin(Address),
-    ExecuteCall(Address, Symbol, Vec<u64>),
+    ExecuteCall(Address, Symbol),
 }
 
 #[contracttype]
@@ -85,6 +86,7 @@ pub enum DataKey {
     ArbitratorList,
     ArbitratorCompensation,
     Appeal(u32),
+    AllowedCall(Address, Symbol),
 }
 
 #[contracttype]
@@ -140,6 +142,12 @@ impl GovernanceContract {
             panic!("invalid quorum bps");
         }
 
+        env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&TOKEN, &mnt_token);
+        env.storage().instance().set(&SNAPSHOT, &snapshot_contract);
+        env.storage().instance().set(&VOTING_PERIOD_SECS, &period);
+        env.storage().instance().set(&QUORUM_BPS, &quorum);
+        env.storage().instance().set(&PROPOSAL_COUNT, &0u32);
         env.storage().persistent().set(&ADMIN, &admin);
         env.storage().persistent().set(&TOKEN, &mnt_token);
 
@@ -156,7 +164,7 @@ impl GovernanceContract {
     }
 
     pub fn set_timelock(env: Env, timelock: Address) {
-        let admin: Address = env.storage().persistent().get(&ADMIN).unwrap();
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
         admin.require_auth();
         env.storage()
             .persistent()
@@ -171,6 +179,25 @@ impl GovernanceContract {
         );
     }
 
+    /// Add a (target, function) pair to the ExecuteCall allowlist. Admin only.
+    pub fn add_allowed_call(env: Env, admin: Address, target: Address, function: Symbol) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedCall(target.clone(), function.clone()), &true);
+        env.events().publish(
+            (Symbol::new(&env, "governance"), Symbol::new(&env, "call_allowed")),
+            (target, function),
+        );
+    }
+
+    pub fn is_call_allowed(env: Env, target: Address, function: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedCall(target, function))
+            .unwrap_or(false)
+    }
+
     pub fn create_proposal(
         env: Env,
         proposer: Address,
@@ -181,6 +208,16 @@ impl GovernanceContract {
         proposer.require_auth();
         Self::require_initialized(&env);
 
+        // ExecuteCall proposals must target an allowlisted (contract, function) pair
+        if let ProposalAction::ExecuteCall(ref target, ref function) = action {
+            if !env.storage().persistent().get::<_, bool>(
+                &DataKey::AllowedCall(target.clone(), function.clone())
+            ).unwrap_or(false) {
+                panic!("call not allowlisted");
+            }
+        }
+
+        let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         let mut count: u32 = env
             .storage()
             .persistent()
@@ -191,13 +228,13 @@ impl GovernanceContract {
         let now = env.ledger().timestamp();
         let voting_period_secs: u64 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&VOTING_PERIOD_SECS)
             .unwrap_or(DEFAULT_VOTING_PERIOD_SECS);
 
         let snapshot_contract: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
         env.invoke_contract::<()>(
@@ -230,7 +267,7 @@ impl GovernanceContract {
             timelock_op_id: None,
         };
 
-        env.storage().persistent().set(&PROPOSAL_COUNT, &count);
+        env.storage().instance().set(&PROPOSAL_COUNT, &count);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(count), &proposal);
@@ -259,7 +296,7 @@ impl GovernanceContract {
 
         let snapshot_contract: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
         let weight: i128 = env.invoke_contract(
@@ -320,7 +357,7 @@ impl GovernanceContract {
 
         let quorum_bps: u32 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&QUORUM_BPS)
             .unwrap_or(DEFAULT_QUORUM_BPS);
         let total_votes = proposal
@@ -366,6 +403,15 @@ impl GovernanceContract {
             (proposal.votes_for, proposal.votes_against, quorum_met),
         );
 
+        // ExecuteCall requires an additional 7-day delay after voting ends
+        if let ProposalAction::ExecuteCall(_, _) = &proposal.action {
+            let earliest_execute = proposal
+                .voting_ends_at
+                .checked_add(EXECUTE_CALL_TIMELOCK_SECS)
+                .expect("timelock overflow");
+            if env.ledger().timestamp() < earliest_execute {
+                panic!("ExecuteCall timelock not elapsed");
+            }
         // Get timelock contract
         let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
         
@@ -436,7 +482,7 @@ impl GovernanceContract {
     pub fn cancel_proposal(env: Env, proposal_id: u32) {
         let admin: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&ADMIN)
             .expect("not initialized");
         admin.require_auth();
@@ -592,7 +638,7 @@ impl GovernanceContract {
     }
 
     fn require_initialized(env: &Env) {
-        if !env.storage().persistent().has(&ADMIN) {
+        if !env.storage().instance().has(&ADMIN) {
             panic!("not initialized");
         }
     }
@@ -601,7 +647,7 @@ impl GovernanceContract {
         admin.require_auth();
         let stored: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&ADMIN)
             .expect("not initialized");
         if &stored != admin {
@@ -621,7 +667,7 @@ impl GovernanceContract {
 
     #[allow(dead_code)]
     fn token_address(env: &Env) -> Address {
-        env.storage().persistent().get(&TOKEN).expect("token not set")
+        env.storage().instance().get(&TOKEN).expect("token not set")
     }
 
     #[allow(dead_code)]
@@ -658,12 +704,8 @@ impl GovernanceContract {
             ProposalAction::UpdateAdmin(new_admin) => {
                 env.storage().instance().set(&ADMIN, new_admin);
             }
-            ProposalAction::ExecuteCall(target, function, args) => {
-                let mut val_args = vec![env];
-                for arg in args.iter() {
-                    val_args.push_back(soroban_sdk::Val::from_payload(arg));
-                }
-                env.invoke_contract::<soroban_sdk::Val>(target, function, val_args);
+            ProposalAction::ExecuteCall(target, function) => {
+                env.invoke_contract::<soroban_sdk::Val>(target, function, vec![env]);
             }
         }
     }
@@ -864,6 +906,108 @@ mod tests {
 
         gov.vote(&voter, &proposal_id, &true);
         gov.vote(&voter, &proposal_id, &false);
+    }
+
+    #[contract]
+    pub struct MockTarget;
+
+    #[contractimpl]
+    impl MockTarget {
+        pub fn do_thing(_env: Env) {}
+    }
+
+    fn setup(env: &Env) -> (
+        GovernanceContractClient,
+        Address, // admin
+        Address, // voter
+        Address, // token_id
+        Address, // snapshot_id
+    ) {
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(env, &gov_id);
+        let token = MockMntTokenClient::new(env, &token_id);
+        let snapshot = MockSnapshotClient::new(env, &snapshot_id);
+        snapshot.set_token(&token_id);
+        let admin = Address::generate(env);
+        let voter = Address::generate(env);
+        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &600i128);
+        (gov, admin, voter, token_id, snapshot_id)
+    }
+
+    #[test]
+    #[should_panic(expected = "call not allowlisted")]
+    fn test_execute_call_rejected_if_not_allowlisted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (gov, _admin, voter, _, _) = setup(&env);
+
+        let target = Address::generate(&env);
+        let title = Bytes::from_slice(&env, b"Exec call");
+        let description_hash = BytesN::from_array(&env, &[9u8; 32]);
+        gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target, Symbol::new(&env, "do_thing")),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ExecuteCall timelock not elapsed")]
+    fn test_execute_call_timelock_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (gov, admin, voter, _, _) = setup(&env);
+
+        let target_id = env.register_contract(None, MockTarget);
+        let fn_name = Symbol::new(&env, "do_thing");
+        gov.add_allowed_call(&admin, &target_id, &fn_name);
+
+        let title = Bytes::from_slice(&env, b"Exec call");
+        let description_hash = BytesN::from_array(&env, &[10u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target_id, fn_name),
+        );
+
+        gov.vote(&voter, &proposal_id, &true);
+        // Advance past voting period but NOT past the 7-day timelock
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id); // should panic
+    }
+
+    #[test]
+    fn test_execute_call_succeeds_after_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (gov, admin, voter, _, _) = setup(&env);
+
+        let target_id = env.register_contract(None, MockTarget);
+        let fn_name = Symbol::new(&env, "do_thing");
+        gov.add_allowed_call(&admin, &target_id, &fn_name);
+
+        let title = Bytes::from_slice(&env, b"Exec call");
+        let description_hash = BytesN::from_array(&env, &[11u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target_id, fn_name),
+        );
+
+        gov.vote(&voter, &proposal_id, &true);
+        // Advance past voting period AND 7-day timelock
+        env.ledger().set_timestamp(env.ledger().timestamp() + 10 + 7 * 24 * 60 * 60 + 1);
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
     }
 
     #[test]
