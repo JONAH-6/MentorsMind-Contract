@@ -338,6 +338,7 @@ mod tests {
             }
 
             pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+                from.require_auth();
                 let from_bal: i128 = env
                     .storage()
                     .persistent()
