@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "escrow",
     "multisig",
-    "contracts/dispute_evidence",
     "contracts/health_dashboard",
     "contracts/mnt-token",
     "contracts/shared",
