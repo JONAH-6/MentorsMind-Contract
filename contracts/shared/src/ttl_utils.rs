@@ -1,6 +1,4 @@
 //! TTL utilities and heuristics for bumping persisted entries.
-#![no_std]
-
 use soroban_sdk::Env;
 
 /// Suggests a next bump interval (in seconds) based on the current TTL.

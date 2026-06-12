@@ -178,7 +178,7 @@ const MAX_FEE_BPS: u32 = 1_000;
 /// Default auto-release delay: 72 hours in seconds.
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
 
-// Approved token registry key prefix: ("APRV_TOK", address) → bool
+// Approved token registry key prefix: ("APRV_TOK", address → bool
 const APPROVED_TOKEN_KEY: Symbol = symbol_short!("APRV_TOK");
 
 // Cache key for admin address

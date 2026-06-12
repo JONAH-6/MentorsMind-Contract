@@ -30,8 +30,7 @@ This is a Cargo workspace (`Cargo.toml`) containing multiple Soroban contract cr
 - `tests/` – workspace tests and scenario suites (including state machine tests)
 - `scripts/` – deployment, upgrade, local environment setup, and helper scripts
 - `docs/` – architecture, deployment, security, runbooks, and operational guidance
-- `mentorminds-backend/` – Node/TS backend utilities for local development, event indexing, migrations, etc.
-- `packages/contracts-sdk/` – typed TypeScript SDK for contract bindings
+
 
 ### 2.2 Contracts (general pattern)
 
@@ -233,18 +232,7 @@ A key requirement is to keep critical functions under a target CPU-instruction l
 
 ---
 
-## 11. SDK and backend
-
-- **TypeScript SDK**: `packages/contracts-sdk/`
-  - provides fully typed bindings for contract structs/events
-  - reduces manual encoding burden
-
-- **Backend**: `mentorminds-backend/`
-  - local dev orchestration, migrations, event indexing tooling, and integration test support
-
----
-
-## 12. Contributing
+## 11. Contributing
 
 See `CONTRIBUTING.md` for workflow guidelines.
 

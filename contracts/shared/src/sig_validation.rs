@@ -43,7 +43,7 @@
 /// to absorb validator clock drift.  Payloads with a `deadline` more than
 /// `MAX_DEADLINE_SECS` in the future are also rejected to limit the window
 /// during which a stolen signature can be used.
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Val};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol};
 
 // ---------------------------------------------------------------------------
 // Constants

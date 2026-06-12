@@ -1,5 +1,3 @@
-#![no_std]
-
 use soroban_sdk::{contracttype, Address, Symbol};
 
 /// Shared escrow status enum used across escrow and reputation contracts.
