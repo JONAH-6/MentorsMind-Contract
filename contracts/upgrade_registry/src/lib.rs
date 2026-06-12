@@ -456,9 +456,6 @@ impl UpgradeRegistryContract {
             return Err(Error::NotSubscribed);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Subscribers(contract_name.clone()), &new_subscribers);
         // Rebuild the list instead of mutating in place; the intent is clearer
         // and the resulting state stays deterministic.
         env.storage().persistent().set(
