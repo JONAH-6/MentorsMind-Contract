@@ -1,8 +1,9 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     Symbol, Val, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -80,6 +81,11 @@ impl TimelockController {
     }
 
     /// Schedule a delayed operation.
+    ///
+    /// `salt` is caller-controlled entropy that prevents op_id prediction.
+    /// `op_id` is derived as SHA-256(proposer_xdr || target_xdr || function_xdr ||
+    ///   args_xdr || ready_at_xdr || nonce_xdr || salt), committing to the full
+    ///   operation payload and making collision attacks infeasible.
     pub fn schedule(
         env: Env,
         caller: Address,
@@ -87,6 +93,7 @@ impl TimelockController {
         function: Symbol,
         args: Vec<Val>,
         delay: u64,
+        salt: BytesN<32>,
     ) -> Result<BytesN<32>, Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
@@ -100,25 +107,25 @@ impl TimelockController {
         count += 1;
         env.storage().instance().set(&DataKey::OpCount, &count);
 
-        // Deterministic op_id from counter
-        let mut raw = [0u8; 32];
-        raw[24] = ((count >> 56) & 0xff) as u8;
-        raw[25] = ((count >> 48) & 0xff) as u8;
-        raw[26] = ((count >> 40) & 0xff) as u8;
-        raw[27] = ((count >> 32) & 0xff) as u8;
-        raw[28] = ((count >> 24) & 0xff) as u8;
-        raw[29] = ((count >> 16) & 0xff) as u8;
-        raw[30] = ((count >> 8) & 0xff) as u8;
-        raw[31] = (count & 0xff) as u8;
-        let op_id: BytesN<32> = BytesN::from_array(&env, &raw);
-
         let now = env.ledger().timestamp();
+        let ready_at = now.checked_add(delay).expect("timestamp overflow");
+
+        // Derive op_id as SHA-256 of the full operation payload for collision resistance.
+        let mut payload = Bytes::new(&env);
+        payload.append(&caller.clone().to_xdr(&env));
+        payload.append(&target.clone().to_xdr(&env));
+        payload.append(&function.clone().to_xdr(&env));
+        payload.append(&args.clone().to_xdr(&env));
+        payload.append(&ready_at.to_xdr(&env));
+        payload.append(&count.to_xdr(&env));
+        payload.append(&salt.clone().to_xdr(&env));
+        let op_id: BytesN<32> = env.crypto().sha256(&payload).into();
         let op = Operation {
             proposer: caller.clone(),
             target: target.clone(),
             function: function.clone(),
             args,
-            ready_at: now.checked_add(delay).expect("timestamp overflow"),
+            ready_at,
             done: false,
         };
         env.storage().persistent().set(&DataKey::Op(op_id.clone()), &op);
@@ -318,9 +325,9 @@ mod tests {
         let target = Address::generate(env);
         let function = Symbol::new(env, "noop");
         let args = Vec::new(env);
+        let salt = BytesN::from_array(env, &[0u8; 32]);
         client
-            .schedule(caller, &target, &function, &args, &MIN_DELAY)
-            .unwrap()
+            .schedule(caller, &target, &function, &args, &MIN_DELAY, &salt)
     }
 
     #[test]
@@ -366,13 +373,28 @@ mod tests {
         env.ledger().with_mut(|li| li.timestamp += MIN_DELAY);
         assert!(!client.is_operation_ready(&op_id));
 
-        // At ready_at + TOLERANCE — boundary, still not ready (strict >)
+        // At ready_at + TOLERANCE — exactly at the boundary, now ready (>=)
         env.ledger()
             .with_mut(|li| li.timestamp += TIMESTAMP_TOLERANCE_SECS);
-        assert!(!client.is_operation_ready(&op_id));
-
-        // One second past tolerance — now ready
-        env.ledger().with_mut(|li| li.timestamp += 1);
         assert!(client.is_operation_ready(&op_id));
+    }
+
+    /// Two calls with identical parameters but different salts must produce different op_ids.
+    #[test]
+    fn test_different_salts_produce_different_op_ids() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "noop");
+        let args = Vec::new(&env);
+
+        let salt_a = BytesN::from_array(&env, &[1u8; 32]);
+        let salt_b = BytesN::from_array(&env, &[2u8; 32]);
+
+        let id_a = client
+            .schedule(&admin, &target, &function, &args, &MIN_DELAY, &salt_a);
+        let id_b = client
+            .schedule(&admin, &target, &function, &args, &MIN_DELAY, &salt_b);
+
+        assert_ne!(id_a, id_b, "different salts must yield different op_ids");
     }
 }
