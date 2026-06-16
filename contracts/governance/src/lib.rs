@@ -85,6 +85,7 @@ pub enum DataKey {
     ArbitratorAt(u32),
     ArbitratorCount,
     ArbitratorIndex(Address),
+    ArbitratorList,
     ArbitratorCompensation,
     Appeal(u32),
     AllowedCall(Address, Symbol),
@@ -160,9 +161,7 @@ impl GovernanceContract {
 
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ArbitratorList, &Vec::<Address>::new(&env));
+
     }
 
     pub fn set_timelock(env: Env, timelock: Address) {
@@ -1102,7 +1101,7 @@ mod tests {
         gov.register_arbitrator(&admin, &a1);
         gov.register_arbitrator(&admin, &a2);
 
-        let list = gov.list_arbitrators();
+        let list = gov.list_arbitrators_page(&0, &10);
         assert_eq!(list.len(), 2);
 
         let selected = gov.select_arbitrator(&7u64);
