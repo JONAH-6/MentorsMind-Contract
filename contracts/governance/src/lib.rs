@@ -83,7 +83,9 @@ pub enum DataKey {
     ApprovedAsset(Address),
     Timelock,
     Arbitrator(Address),
-    ArbitratorList,
+    ArbitratorAt(u32),
+    ArbitratorCount,
+    ArbitratorIndex(Address),
     ArbitratorCompensation,
     Appeal(u32),
     AllowedCall(Address, Symbol),
@@ -520,13 +522,10 @@ impl GovernanceContract {
         env.storage().persistent().set(&key, &record);
 
         if is_new {
-            let mut list: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ArbitratorList)
-                .unwrap_or(Vec::new(&env));
-            list.push_back(arbitrator.clone());
-            env.storage().persistent().set(&DataKey::ArbitratorList, &list);
+            let count: u32 = env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0);
+            env.storage().persistent().set(&DataKey::ArbitratorAt(count), &arbitrator);
+            env.storage().persistent().set(&DataKey::ArbitratorIndex(arbitrator.clone()), &count);
+            env.storage().persistent().set(&DataKey::ArbitratorCount, &(count + 1));
         }
 
         env.events().publish(
@@ -535,33 +534,89 @@ impl GovernanceContract {
         );
     }
 
-    pub fn list_arbitrators(env: Env) -> Vec<ArbitratorRecord> {
+    pub fn unregister_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        Self::assert_admin(&env, &admin);
+        let key = DataKey::Arbitrator(arbitrator.clone());
+        if !env.storage().persistent().has(&key) {
+            panic!("arbitrator not found");
+        }
+        
+        let count: u32 = env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0);
+        if count == 0 {
+            panic!("no arbitrators");
+        }
+        
+        let index: u32 = env.storage().persistent().get(&DataKey::ArbitratorIndex(arbitrator.clone())).expect("arbitrator index not found");
+        let last_index = count - 1;
+        
+        if index != last_index {
+            let last_arbitrator: Address = env.storage().persistent().get(&DataKey::ArbitratorAt(last_index)).expect("last arbitrator not found");
+            env.storage().persistent().set(&DataKey::ArbitratorAt(index), &last_arbitrator);
+            env.storage().persistent().set(&DataKey::ArbitratorIndex(last_arbitrator), &index);
+        }
+        
+        env.storage().persistent().remove(&DataKey::ArbitratorAt(last_index));
+        env.storage().persistent().remove(&DataKey::ArbitratorIndex(arbitrator.clone()));
+        env.storage().persistent().remove(&key);
+        env.storage().persistent().set(&DataKey::ArbitratorCount, &last_index);
+        
+        env.events().publish(
+            (Symbol::new(&env, "governance"), Symbol::new(&env, "arbitrator_unregistered")),
+            arbitrator,
+        );
+    }
+
+    pub fn get_arbitrator_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0)
+    }
+
+    pub fn list_arbitrators_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let count = Self::get_arbitrator_count(env.clone());
         let mut out = Vec::new(&env);
-        let list: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
-        for addr in list.iter() {
-            if let Some(record) = env.storage().persistent().get::<_, ArbitratorRecord>(&DataKey::Arbitrator(addr.clone())) {
-                out.push_back(record);
+        let end = (offset + limit).min(count);
+        for i in offset..end {
+            if let Some(addr) = env.storage().persistent().get::<_, Address>(&DataKey::ArbitratorAt(i)) {
+                out.push_back(addr);
             }
         }
         out
     }
 
     pub fn select_arbitrator(env: Env, dispute_id: u64) -> Address {
-        let mut active = Vec::new(&env);
-        for record in Self::list_arbitrators(env.clone()).iter() {
+        let count = Self::get_arbitrator_count(env.clone());
+        if count == 0 {
+            panic!("no arbitrators");
+        }
+        
+        let start_idx = (dispute_id % (count as u64)) as u32;
+        let mut idx = start_idx;
+        loop {
+            let addr: Address = env.storage().persistent().get(&DataKey::ArbitratorAt(idx)).expect("invalid arbitrator index");
+            let record: ArbitratorRecord = env.storage().persistent().get(&DataKey::Arbitrator(addr.clone())).expect("arbitrator record not found");
             if record.active {
-                active.push_back(record.address.clone());
+                return addr;
+            }
+            idx = (idx + 1) % count;
+            if idx == start_idx {
+                panic!("no active arbitrators");
             }
         }
-        if active.is_empty() {
-            panic!("no active arbitrators");
+    }
+
+    pub fn migrate_arbitrators(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        if let Some(list) = env.storage().persistent().get::<_, Vec<Address>>(&DataKey::ArbitratorList) {
+            let mut count: u32 = env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0);
+            for addr in list.iter() {
+                if !env.storage().persistent().has(&DataKey::ArbitratorIndex(addr.clone())) {
+                    env.storage().persistent().set(&DataKey::ArbitratorAt(count), &addr);
+                    env.storage().persistent().set(&DataKey::ArbitratorIndex(addr.clone()), &count);
+                    count += 1;
+                }
+            }
+            env.storage().persistent().set(&DataKey::ArbitratorCount, &count);
+            env.storage().persistent().remove(&DataKey::ArbitratorList);
         }
-        let idx = (dispute_id as u32) % active.len();
-        active.get(idx).expect("invalid arbitrator index")
     }
 
     pub fn set_arbitration_compensation(env: Env, admin: Address, amount: i128) {
