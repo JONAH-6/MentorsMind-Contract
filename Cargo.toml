@@ -9,7 +9,8 @@ members = [
     "contracts/mnt-token",
     "contracts/shared",
     "contracts/verification",
-    "contracts/governance",
+    "contracts/referral",
+    "contracts/referral_leaderboard",
 ]
 
 [workspace.package]
