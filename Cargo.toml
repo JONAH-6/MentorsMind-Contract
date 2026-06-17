@@ -5,6 +5,7 @@ members = [
     "contracts/staking",
     "escrow",
     "multisig",
+    "tools",
     "contracts/health_dashboard",
     "contracts/mnt-token",
     "contracts/shared",
