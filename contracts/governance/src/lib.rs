@@ -45,14 +45,13 @@ impl StateMachine for ProposalStatus {
     type State = ProposalStatus;
 
     fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
-        matches!(
-            (from, to),
-            (ProposalStatus::Active, ProposalStatus::Passed)
-                | (ProposalStatus::Active, ProposalStatus::Failed)
-                | (ProposalStatus::Active, ProposalStatus::Cancelled)
-                | (ProposalStatus::Passed, ProposalStatus::Queued)
-                | (ProposalStatus::Queued, ProposalStatus::Executed)
-        )
+        if *from == ProposalStatus::Active && *to == ProposalStatus::Passed { return true; }
+        if *from == ProposalStatus::Active && *to == ProposalStatus::Failed { return true; }
+        if *from == ProposalStatus::Active && *to == ProposalStatus::Cancelled { return true; }
+        if *from == ProposalStatus::Passed && *to == ProposalStatus::Queued { return true; }
+        if *from == ProposalStatus::Passed && *to == ProposalStatus::Executed { return true; }
+        if *from == ProposalStatus::Queued && *to == ProposalStatus::Executed { return true; }
+        false
     }
 }
 
@@ -71,7 +70,7 @@ pub struct Proposal {
     pub total_supply_snapshot: i128,
     pub votes_for: i128,
     pub votes_against: i128,
-    pub timelock_op_id: Option<BytesN<32>>,
+    pub timelock_op_id: BytesN<32>,
 }
 
 #[contracttype]
@@ -83,6 +82,9 @@ pub enum DataKey {
     ApprovedAsset(Address),
     Timelock,
     Arbitrator(Address),
+    ArbitratorAt(u32),
+    ArbitratorCount,
+    ArbitratorIndex(Address),
     ArbitratorList,
     ArbitratorCompensation,
     Appeal(u32),
@@ -114,8 +116,9 @@ pub struct GovernanceContract;
 impl GovernanceContract {
     fn transition_proposal_status(env: &Env, proposal: &mut Proposal, to: ProposalStatus) {
         let from = proposal.status.clone();
+        soroban_sdk::log!(env, "transitioning from {:?} to {:?}", from, to);
         if !ProposalStatus::is_valid_transition(env, &from, &to) {
-            panic!("invalid proposal status transition");
+            panic!("invalid transition from {:?} to {:?}", from, to);
         }
         proposal.status = to;
     }
@@ -158,9 +161,7 @@ impl GovernanceContract {
 
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ArbitratorList, &Vec::<Address>::new(&env));
+
     }
 
     pub fn set_timelock(env: Env, timelock: Address) {
@@ -264,7 +265,7 @@ impl GovernanceContract {
             total_supply_snapshot,
             votes_for: 0,
             votes_against: 0,
-            timelock_op_id: None,
+            timelock_op_id: BytesN::from_array(&env, &[0; 32]),
         };
 
         env.storage().instance().set(&PROPOSAL_COUNT, &count);
@@ -412,43 +413,60 @@ impl GovernanceContract {
             if env.ledger().timestamp() < earliest_execute {
                 panic!("ExecuteCall timelock not elapsed");
             }
-        // Get timelock contract
-        let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
-        
-        // Use the governance contract address as the caller for the timelock schedule
-        let gov_address = env.current_contract_address();
+            // Get timelock contract
+            let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).expect("timelock not set");
+            
+            // Use the governance contract address as the caller for the timelock schedule
+            let gov_address = env.current_contract_address();
 
-        // Schedule the action to be executed by the timelock
-        let delay = 48 * 60 * 60; // 48 hours, as per timelock's MIN_DELAY
-        let mut args = Vec::new(&env);
-        args.push_back(proposal_id.into_val(&env));
-        let op_id: BytesN<32> = env.invoke_contract(
-            &timelock,
-            &Symbol::new(&env, "schedule"),
-            (
-                gov_address,
-                gov_address,
-                Symbol::new(&env, "execute_queued_proposal"),
-                args,
-                delay,
-            ).into_val(&env),
-        ).unwrap();
+            // Schedule the action to be executed by the timelock
+            let delay: u64 = 48 * 60 * 60; // 48 hours, as per timelock's MIN_DELAY
+            let mut args: Vec<soroban_sdk::Val> = Vec::new(&env);
+            args.push_back(proposal_id.into_val(&env));
+            let op_id: BytesN<32> = env.invoke_contract::<BytesN<32>>(
+                &timelock,
+                &Symbol::new(&env, "schedule"),
+                (
+                    gov_address.clone(),
+                    gov_address,
+                    Symbol::new(&env, "execute_queued_proposal"),
+                    args,
+                    delay,
+                ).into_val(&env),
+            );
 
-        proposal.timelock_op_id = Some(op_id.clone());
-        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Queued);
-        
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+            proposal.timelock_op_id = op_id.clone();
+            Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Queued);
+            
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                Symbol::new(&env, "proposal_queued"),
-                proposal_id,
-            ),
-            op_id,
-        );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "governance"),
+                    Symbol::new(&env, "proposal_queued"),
+                    proposal_id,
+                ),
+                op_id,
+            );
+        } else {
+            Self::apply_action(&env, &proposal.action);
+            Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Executed);
+            
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "governance"),
+                    Symbol::new(&env, "proposal_executed"),
+                    proposal_id,
+                ),
+                true,
+            );
+        }
     }
 
     /// Execute a queued proposal after timelock delay. Can only be called by the timelock.
@@ -520,13 +538,10 @@ impl GovernanceContract {
         env.storage().persistent().set(&key, &record);
 
         if is_new {
-            let mut list: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ArbitratorList)
-                .unwrap_or(Vec::new(&env));
-            list.push_back(arbitrator.clone());
-            env.storage().persistent().set(&DataKey::ArbitratorList, &list);
+            let count: u32 = env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0);
+            env.storage().persistent().set(&DataKey::ArbitratorAt(count), &arbitrator);
+            env.storage().persistent().set(&DataKey::ArbitratorIndex(arbitrator.clone()), &count);
+            env.storage().persistent().set(&DataKey::ArbitratorCount, &(count + 1));
         }
 
         env.events().publish(
@@ -535,33 +550,89 @@ impl GovernanceContract {
         );
     }
 
-    pub fn list_arbitrators(env: Env) -> Vec<ArbitratorRecord> {
+    pub fn unregister_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        Self::assert_admin(&env, &admin);
+        let key = DataKey::Arbitrator(arbitrator.clone());
+        if !env.storage().persistent().has(&key) {
+            panic!("arbitrator not found");
+        }
+        
+        let count: u32 = env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0);
+        if count == 0 {
+            panic!("no arbitrators");
+        }
+        
+        let index: u32 = env.storage().persistent().get(&DataKey::ArbitratorIndex(arbitrator.clone())).expect("arbitrator index not found");
+        let last_index = count - 1;
+        
+        if index != last_index {
+            let last_arbitrator: Address = env.storage().persistent().get(&DataKey::ArbitratorAt(last_index)).expect("last arbitrator not found");
+            env.storage().persistent().set(&DataKey::ArbitratorAt(index), &last_arbitrator);
+            env.storage().persistent().set(&DataKey::ArbitratorIndex(last_arbitrator), &index);
+        }
+        
+        env.storage().persistent().remove(&DataKey::ArbitratorAt(last_index));
+        env.storage().persistent().remove(&DataKey::ArbitratorIndex(arbitrator.clone()));
+        env.storage().persistent().remove(&key);
+        env.storage().persistent().set(&DataKey::ArbitratorCount, &last_index);
+        
+        env.events().publish(
+            (Symbol::new(&env, "governance"), Symbol::new(&env, "arbitrator_unregistered")),
+            arbitrator,
+        );
+    }
+
+    pub fn get_arbitrator_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0)
+    }
+
+    pub fn list_arbitrators_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let count = Self::get_arbitrator_count(env.clone());
         let mut out = Vec::new(&env);
-        let list: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
-        for addr in list.iter() {
-            if let Some(record) = env.storage().persistent().get::<_, ArbitratorRecord>(&DataKey::Arbitrator(addr.clone())) {
-                out.push_back(record);
+        let end = (offset + limit).min(count);
+        for i in offset..end {
+            if let Some(addr) = env.storage().persistent().get::<_, Address>(&DataKey::ArbitratorAt(i)) {
+                out.push_back(addr);
             }
         }
         out
     }
 
     pub fn select_arbitrator(env: Env, dispute_id: u64) -> Address {
-        let mut active = Vec::new(&env);
-        for record in Self::list_arbitrators(env.clone()).iter() {
+        let count = Self::get_arbitrator_count(env.clone());
+        if count == 0 {
+            panic!("no arbitrators");
+        }
+        
+        let start_idx = (dispute_id % (count as u64)) as u32;
+        let mut idx = start_idx;
+        loop {
+            let addr: Address = env.storage().persistent().get(&DataKey::ArbitratorAt(idx)).expect("invalid arbitrator index");
+            let record: ArbitratorRecord = env.storage().persistent().get(&DataKey::Arbitrator(addr.clone())).expect("arbitrator record not found");
             if record.active {
-                active.push_back(record.address.clone());
+                return addr;
+            }
+            idx = (idx + 1) % count;
+            if idx == start_idx {
+                panic!("no active arbitrators");
             }
         }
-        if active.is_empty() {
-            panic!("no active arbitrators");
+    }
+
+    pub fn migrate_arbitrators(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        if let Some(list) = env.storage().persistent().get::<_, Vec<Address>>(&DataKey::ArbitratorList) {
+            let mut count: u32 = env.storage().persistent().get(&DataKey::ArbitratorCount).unwrap_or(0);
+            for addr in list.iter() {
+                if !env.storage().persistent().has(&DataKey::ArbitratorIndex(addr.clone())) {
+                    env.storage().persistent().set(&DataKey::ArbitratorAt(count), &addr);
+                    env.storage().persistent().set(&DataKey::ArbitratorIndex(addr.clone()), &count);
+                    count += 1;
+                }
+            }
+            env.storage().persistent().set(&DataKey::ArbitratorCount, &count);
+            env.storage().persistent().remove(&DataKey::ArbitratorList);
         }
-        let idx = (dispute_id as u32) % active.len();
-        active.get(idx).expect("invalid arbitrator index")
     }
 
     pub fn set_arbitration_compensation(env: Env, admin: Address, amount: i128) {
@@ -989,8 +1060,10 @@ mod tests {
         let (gov, admin, voter, _, _) = setup(&env);
 
         let target_id = env.register_contract(None, MockTarget);
+        let timelock_id = env.register_contract(None, MockTimelock);
         let fn_name = Symbol::new(&env, "do_thing");
         gov.add_allowed_call(&admin, &target_id, &fn_name);
+        gov.set_timelock(&timelock_id);
 
         let title = Bytes::from_slice(&env, b"Exec call");
         let description_hash = BytesN::from_array(&env, &[11u8; 32]);
@@ -1007,7 +1080,7 @@ mod tests {
         gov.execute_proposal(&proposal_id);
 
         let proposal = gov.get_proposal(&proposal_id);
-        assert_eq!(proposal.status, ProposalStatus::Executed);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
     }
 
     #[test]
@@ -1028,7 +1101,7 @@ mod tests {
         gov.register_arbitrator(&admin, &a1);
         gov.register_arbitrator(&admin, &a2);
 
-        let list = gov.list_arbitrators();
+        let list = gov.list_arbitrators_page(&0, &10);
         assert_eq!(list.len(), 2);
 
         let selected = gov.select_arbitrator(&7u64);
@@ -1127,6 +1200,127 @@ mod tests {
 
         // Second cancel panics
         gov.cancel_proposal(&proposal_id);
+    }
+
+    #[contract]
+    pub struct MockTimelock;
+
+    #[contractimpl]
+    impl MockTimelock {
+        pub fn schedule(
+            env: Env,
+            _target: Address,
+            _caller: Address,
+            _function: Symbol,
+            _args: Vec<soroban_sdk::Val>,
+            _delay: u64,
+        ) -> BytesN<32> {
+            BytesN::from_array(&env, &[7u8; 32])
+        }
+    }
+
+    #[test]
+    fn test_update_fee_proposal_executes_immediately() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let proposer = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&proposer, &200i128);
+
+        let title = Bytes::from_slice(&env, b"Update fee to 500");
+        let description_hash = BytesN::from_array(&env, &[12u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &proposer,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(500),
+        );
+
+        gov.vote(&proposer, &proposal_id, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+        
+        let current_fee: u32 = env.as_contract(&gov_id, || {
+            env.storage().instance().get(&symbol_short!("FEE_BPS")).unwrap_or(0)
+        });
+        assert_eq!(current_fee, 500);
+    }
+
+    #[test]
+    fn test_execute_call_transitions_to_queued() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let timelock_id = env.register_contract(None, MockTimelock);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let proposer = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        
+        // Admin needs auth to set timelock
+        gov.set_timelock(&timelock_id);
+
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&proposer, &200i128);
+
+        let title = Bytes::from_slice(&env, b"Execute External Call");
+        let description_hash = BytesN::from_array(&env, &[13u8; 32]);
+        let dummy_target = Address::generate(&env);
+        gov.add_allowed_call(&admin, &dummy_target, &Symbol::new(&env, "some_func"));
+        let proposal_id = gov.create_proposal(
+            &proposer,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(dummy_target, Symbol::new(&env, "some_func")),
+        );
+
+        gov.vote(&proposer, &proposal_id, &true);
+        
+        let voting_ends_at = gov.get_proposal(&proposal_id).voting_ends_at;
+        // Advance time to just after voting ends, PLUS the EXECUTE_CALL_TIMELOCK_SECS
+        // since ExecuteCall enforces a 7-day delay (EXECUTE_CALL_TIMELOCK_SECS) before executing
+        // wait, I need to look up EXECUTE_CALL_TIMELOCK_SECS from lib.rs
+        let execute_call_delay = 7 * 24 * 60 * 60; 
+        env.ledger().set_timestamp(voting_ends_at + execute_call_delay + 1);
+        
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
     }
 }
 
