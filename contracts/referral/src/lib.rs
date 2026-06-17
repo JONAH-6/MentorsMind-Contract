@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::ReentrancyGuard;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol};
 
 #[contracttype]
@@ -165,6 +166,7 @@ impl ReferralContract {
     }
 
     pub fn fulfill_referral(env: Env, referee: Address) {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "fulfill"));
         let admin: Address = env
             .storage()
             .persistent()
@@ -216,6 +218,7 @@ impl ReferralContract {
     }
 
     pub fn claim_reward(env: Env, referrer: Address) {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_reward"));
         referrer.require_auth();
 
         let pending: i128 = env
@@ -282,19 +285,9 @@ impl ReferralContract {
             panic!("Computed reward is zero");
         }
 
-        // --- mint ---
-        let mnt_token: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MNTToken)
-            .expect("Token not set");
-        env.invoke_contract::<()>(
-            &mnt_token,
-            &Symbol::new(&env, "mint"),
-            (referrer.clone(), actual_amount).into_val(&env),
-        );
-
-        // --- update state ---
+        // --- checks-effects-interactions: clear state BEFORE external calls ---
+        // Clearing pending and updating caps before mint prevents double-spend
+        // if a malicious token contract re-enters claim_reward during mint.
         env.storage()
             .persistent()
             .set(&DataKey::PendingReward(referrer.clone()), &0i128);
@@ -305,6 +298,18 @@ impl ReferralContract {
         env.storage()
             .instance()
             .set(&DataKey::GlobalMinted, &(global_minted + actual_amount));
+
+        // --- mint (external call happens after all state is committed) ---
+        let mnt_token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MNTToken)
+            .expect("Token not set");
+        env.invoke_contract::<()>(
+            &mnt_token,
+            &Symbol::new(&env, "mint"),
+            (referrer.clone(), actual_amount).into_val(&env),
+        );
 
         env.events().publish(
             (
@@ -665,5 +670,126 @@ mod test {
 
         assert!(total_minted <= global_cap);
         assert!(f.client().get_global_referral_minted() <= global_cap);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reentrancy simulation: malicious token that calls back into claim_reward
+    // -----------------------------------------------------------------------
+
+    /// A mock MNT token that attempts to re-enter claim_reward during mint.
+    /// The ReentrancyGuard must block the second call and the pending balance
+    /// must be zero after a single successful claim (no double-mint).
+    #[contract]
+    pub struct ReentrantMockMNT;
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockMNTKey {
+        Balance(Address),
+        ReferralContract,
+    }
+
+    #[contractimpl]
+    impl ReentrantMockMNT {
+        /// Store the referral contract address so mint knows where to call back.
+        pub fn set_referral_contract(env: Env, referral: Address) {
+            env.storage().instance().set(&MockMNTKey::ReferralContract, &referral);
+        }
+
+        pub fn initialize(_env: Env, _admin: Address) {}
+
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            // Record the mint in internal balance
+            let bal: i128 = env
+                .storage()
+                .persistent()
+                .get(&MockMNTKey::Balance(to.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&MockMNTKey::Balance(to.clone()), &(bal + amount));
+
+            // Attempt re-entrant callback into claim_reward — must be blocked
+            if let Some(referral_contract) =
+                env.storage().instance().get::<_, Address>(&MockMNTKey::ReferralContract)
+            {
+                // This call should panic with "reentrant call" because the
+                // referral contract's lock is still held.
+                let _result = env.invoke_contract::<()>(
+                    &referral_contract,
+                    &Symbol::new(&env, "claim_reward"),
+                    (to.clone(),).into_val(&env),
+                );
+            }
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockMNTKey::Balance(id))
+                .unwrap_or(0)
+        }
+    }
+
+    /// Verify that a malicious token cannot trigger a double-mint via reentrancy.
+    ///
+    /// Setup:
+    ///   - Deploy a ReentrantMockMNT whose `mint` calls back into `claim_reward`.
+    ///   - The referral contract guards `claim_reward` with ReentrancyGuard.
+    ///
+    /// Expected: the outer claim succeeds; the inner callback panics with
+    /// "reentrant call", causing the whole transaction to revert — the net
+    /// result is that no mint ever lands (Soroban atomically rolls back on panic).
+    /// We verify this by asserting the call returns an error.
+    #[test]
+    fn test_reentrancy_blocked_single_mint() {
+        extern crate std;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let reentrant_mnt = env.register_contract(None, ReentrantMockMNT);
+        let leaderboard_id = env.register_contract(
+            None,
+            mentorminds_referral_leaderboard::ReferralLeaderboardContract,
+        );
+        let ref_id = env.register_contract(None, ReferralContract);
+
+        // Initialize leaderboard and referral with the malicious token
+        let leaderboard_client =
+            mentorminds_referral_leaderboard::ReferralLeaderboardContractClient::new(
+                &env,
+                &leaderboard_id,
+            );
+        leaderboard_client.initialize(&ref_id);
+
+        let ref_client = ReferralContractClient::new(&env, &ref_id);
+        ref_client.initialize(&admin, &reentrant_mnt, &leaderboard_id);
+
+        // Tell the malicious token where to call back
+        let mock_client = ReentrantMockMNTClient::new(&env, &reentrant_mnt);
+        mock_client.set_referral_contract(&ref_id);
+
+        // Set up a referral so there is a pending reward to claim
+        let referrer = Address::generate(&env);
+        let referee = Address::generate(&env);
+        ref_client.register_referral(&referrer, &referee, &true);
+        ref_client.fulfill_referral(&referee);
+
+        // claim_reward will invoke malicious mint → mint tries to re-enter claim_reward
+        // → ReentrancyGuard panics → entire tx reverts
+        let result = ref_client.try_claim_reward(&referrer);
+        assert!(
+            result.is_err(),
+            "Expected reentrancy to be blocked — tx should revert"
+        );
+
+        // Because the tx reverted, pending reward is still intact (no partial state)
+        assert_eq!(
+            ref_client.get_pending_rewards(&referrer),
+            REWARD_MENTOR,
+            "Pending reward must remain after reverted reentrant claim"
+        );
     }
 }

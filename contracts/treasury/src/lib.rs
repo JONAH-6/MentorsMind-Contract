@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     IntoVal, Symbol, Vec,
@@ -160,6 +161,7 @@ impl TreasuryContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "allocate"));
         let admin = env
             .storage()
             .persistent()
@@ -209,6 +211,7 @@ impl TreasuryContract {
         token: Address,
         total_amount: i128,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "distribute"));
         let admin = env
             .storage()
             .persistent()
@@ -264,6 +267,7 @@ impl TreasuryContract {
         xlm_amount: i128,
         min_mnt_out: i128,
     ) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "buyback"));
         let admin = env
             .storage()
             .persistent()
