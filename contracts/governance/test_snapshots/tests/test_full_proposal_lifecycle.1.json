@@ -135,7 +135,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "u32": 1
+                  "u32": 0
                 }
               }
             },
@@ -275,45 +275,6 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "ArbitratorList"
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "ArbitratorList"
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "vec": []
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          4095
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
                   "symbol": "Proposal"
                 },
                 {
@@ -409,6 +370,14 @@
                             "symbol": "Executed"
                           }
                         ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "timelock_op_id"
+                      },
+                      "val": {
+                        "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
                       }
                     },
                     {
@@ -599,10 +568,58 @@
                     "storage": [
                       {
                         "key": {
+                          "symbol": "ADMIN"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "FEE_BPS"
                         },
                         "val": {
                           "u32": 300
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "PROP_CNT"
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "QRM_BPS"
+                        },
+                        "val": {
+                          "u32": 1000
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "SNAPSHOT"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "TOKEN"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "VOT_PER"
+                        },
+                        "val": {
+                          "u64": 10
                         }
                       }
                     ]
@@ -1630,6 +1647,44 @@
       "event": {
         "ext": "v0",
         "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "log"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "transitioning from {:?} to {:?}"
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "Active"
+                    }
+                  ]
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "Passed"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
         "type_": "contract",
         "body": {
           "v0": {
@@ -1660,6 +1715,44 @@
                 },
                 {
                   "bool": true
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "log"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "transitioning from {:?} to {:?}"
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "Passed"
+                    }
+                  ]
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "Executed"
+                    }
+                  ]
                 }
               ]
             }
@@ -1823,6 +1916,14 @@
                         "symbol": "Executed"
                       }
                     ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "timelock_op_id"
+                  },
+                  "val": {
+                    "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
                   }
                 },
                 {

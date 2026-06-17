@@ -31,18 +31,40 @@ pub struct RewardClaimedEventData {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralConfig {
+    /// Maximum multiplier allowed in basis points (e.g. 20000 = 2x).
+    pub max_multiplier_bps: u32,
+    /// Maximum lifetime MNT a single referrer can ever claim (in raw units).
+    pub max_lifetime_reward: i128,
+    /// Global cap on total MNT that can ever be minted through referrals.
+    pub global_referral_mint_cap: i128,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
     MNTToken,
     LeaderboardContract,
-    Referral(Address), // referee -> ReferralInfo
+    Config,
+    Referral(Address),       // referee -> ReferralInfo
     ReferrerCount(Address),
-    PendingReward(Address), // referrer -> amount
+    PendingReward(Address),  // referrer -> amount
+    LifetimeClaimed(Address), // referrer -> total ever claimed
+    GlobalMinted,            // i128: total minted through referrals
 }
 
 const REWARD_MENTOR: i128 = 50 * 10_000_000; // 50 MNT (7 decimals)
 const REWARD_LEARNER: i128 = 20 * 10_000_000; // 20 MNT (7 decimals)
+
+/// Default config values used when none is set at initialize time.
+/// max_multiplier_bps = 20000 (2x), matching the leaderboard top tier.
+/// max_lifetime_reward = 10_000 MNT per referrer.
+/// global_referral_mint_cap = 5_000_000 MNT (5% of the 100M supply cap).
+const DEFAULT_MAX_MULTIPLIER_BPS: u32 = 20_000;
+const DEFAULT_MAX_LIFETIME_REWARD: i128 = 10_000 * 10_000_000;
+const DEFAULT_GLOBAL_REFERRAL_MINT_CAP: i128 = 5_000_000 * 10_000_000;
 
 #[contract]
 pub struct ReferralContract;
@@ -54,12 +76,37 @@ impl ReferralContract {
             panic!("Already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage()
+        env.storage().persistent().set(&DataKey::MNTToken, &mnt_token);
+        env.storage().persistent().set(&DataKey::LeaderboardContract, &leaderboard);
+
+        let config = ReferralConfig {
+            max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::GlobalMinted, &0i128);
+    }
+
+    /// Update referral config. Admin only.
+    pub fn set_config(env: Env, config: ReferralConfig) {
+        let admin: Address = env
+            .storage()
             .persistent()
-            .set(&DataKey::MNTToken, &mnt_token);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LeaderboardContract, &leaderboard);
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if config.max_multiplier_bps == 0 {
+            panic!("max_multiplier_bps must be > 0");
+        }
+        if config.max_lifetime_reward <= 0 {
+            panic!("max_lifetime_reward must be positive");
+        }
+        if config.global_referral_mint_cap <= 0 {
+            panic!("global_referral_mint_cap must be positive");
+        }
+        env.storage().instance().set(&DataKey::Config, &config);
     }
 
     pub fn register_referral(env: Env, referrer: Address, referee: Address, is_mentor: bool) {
@@ -152,7 +199,7 @@ impl ReferralContract {
         pending += reward;
         env.storage()
             .persistent()
-            .set(&DataKey::PendingReward(info.referrer), &pending);
+            .set(&DataKey::PendingReward(info.referrer.clone()), &pending);
 
         // Update leaderboard
         let leaderboard: Address = env
@@ -160,7 +207,7 @@ impl ReferralContract {
             .persistent()
             .get(&DataKey::LeaderboardContract)
             .expect("Leaderboard not set");
-        let count = Self::get_referral_count(env, info.referrer.clone());
+        let count = Self::get_referral_count(env.clone(), info.referrer.clone());
         env.invoke_contract::<()>(
             &leaderboard,
             &Symbol::new(&env, "record_referral"),
@@ -180,35 +227,84 @@ impl ReferralContract {
             panic!("No rewards to claim");
         }
 
+        let config: ReferralConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("Config not set");
+
+        // --- multiplier: clamp to max_multiplier_bps ---
         let leaderboard: Address = env
             .storage()
             .persistent()
             .get(&DataKey::LeaderboardContract)
             .expect("Leaderboard not set");
-        let multiplier: u32 = env.invoke_contract(
+        let raw_multiplier: u32 = env.invoke_contract(
             &leaderboard,
             &Symbol::new(&env, "get_multiplier"),
             (referrer.clone(),).into_val(&env),
         );
+        let multiplier = raw_multiplier.min(config.max_multiplier_bps);
 
-        let actual_amount = (pending * multiplier as i128) / 10000;
+        let actual_amount = (pending * multiplier as i128) / 10_000;
 
+        // --- per-address lifetime cap ---
+        let lifetime_claimed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LifetimeClaimed(referrer.clone()))
+            .unwrap_or(0);
+        let remaining_lifetime = config
+            .max_lifetime_reward
+            .checked_sub(lifetime_claimed)
+            .unwrap_or(0);
+        if remaining_lifetime <= 0 {
+            panic!("Lifetime reward cap reached");
+        }
+        let actual_amount = actual_amount.min(remaining_lifetime);
+
+        // --- global referral mint cap ---
+        let global_minted: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalMinted)
+            .unwrap_or(0);
+        let global_remaining = config
+            .global_referral_mint_cap
+            .checked_sub(global_minted)
+            .unwrap_or(0);
+        if global_remaining <= 0 {
+            panic!("Global referral mint cap reached");
+        }
+        let actual_amount = actual_amount.min(global_remaining);
+
+        if actual_amount <= 0 {
+            panic!("Computed reward is zero");
+        }
+
+        // --- mint ---
         let mnt_token: Address = env
             .storage()
             .persistent()
             .get(&DataKey::MNTToken)
             .expect("Token not set");
-
-        // Mint the actual amount
         env.invoke_contract::<()>(
             &mnt_token,
             &Symbol::new(&env, "mint"),
             (referrer.clone(), actual_amount).into_val(&env),
         );
 
+        // --- update state ---
         env.storage()
             .persistent()
             .set(&DataKey::PendingReward(referrer.clone()), &0i128);
+        env.storage().persistent().set(
+            &DataKey::LifetimeClaimed(referrer.clone()),
+            &(lifetime_claimed + actual_amount),
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalMinted, &(global_minted + actual_amount));
 
         env.events().publish(
             (
@@ -241,9 +337,15 @@ impl ReferralContract {
             .expect("Not initialized")
     }
 
+    /// Total MNT minted through referrals so far.
+    pub fn get_global_referral_minted(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GlobalMinted)
+            .unwrap_or(0)
+    }
+
     /// Distribute a portion of platform fees as referral rewards.
-    /// `reward_bps` basis points of `platform_fee` are added to the referrer's
-    /// pending rewards. Admin only.
     pub fn distribute_from_fee(
         env: Env,
         referrer: Address,
@@ -261,8 +363,6 @@ impl ReferralContract {
             return;
         }
 
-        // Multiply first to preserve precision, then divide — matching the
-        // escrow fee formula so referral rewards are computed consistently.
         let reward = platform_fee
             .checked_mul(reward_bps as i128)
             .expect("overflow")
@@ -322,7 +422,6 @@ mod test {
             let ref_id = env.register_contract(None, ReferralContract);
 
             let mnt_client = MNTTokenClient::new(&env, &mnt_id);
-            // Make the referral contract the admin of the MNT token so it can mint!
             mnt_client.initialize(&ref_id);
 
             let leaderboard_client = ReferralLeaderboardContractClient::new(&env, &leaderboard_id);
@@ -331,13 +430,7 @@ mod test {
             let ref_client = ReferralContractClient::new(&env, &ref_id);
             ref_client.initialize(&admin, &mnt_id, &leaderboard_id);
 
-            TestFixture {
-                env,
-                mnt_id,
-                ref_id,
-                leaderboard_id,
-                admin,
-            }
+            TestFixture { env, mnt_id, ref_id, leaderboard_id, admin }
         }
 
         fn client(&self) -> ReferralContractClient {
@@ -353,6 +446,7 @@ mod test {
     fn test_initialization() {
         let f = TestFixture::setup();
         assert_eq!(f.client().get_referral_count(&Address::generate(&f.env)), 0);
+        assert_eq!(f.client().get_global_referral_minted(), 0);
     }
 
     #[test]
@@ -361,8 +455,7 @@ mod test {
         let referrer = Address::generate(&f.env);
         let referee = Address::generate(&f.env);
 
-        // Register referral as admin
-        f.client().register_referral(&referrer, &referee, &true); // true = mentor
+        f.client().register_referral(&referrer, &referee, &true);
         assert_eq!(f.client().get_referral_count(&referrer), 1);
         assert_eq!(f.client().get_pending_rewards(&referrer), 0);
 
@@ -380,23 +473,16 @@ mod test {
         );
         let payload = ReferralRegisteredEventData::try_from_val(&f.env, &last_event.2)
             .expect("registered payload should decode");
-        assert_eq!(
-            payload,
-            ReferralRegisteredEventData {
-                referee: referee.clone(),
-                is_mentor: true,
-            }
-        );
+        assert_eq!(payload, ReferralRegisteredEventData { referee: referee.clone(), is_mentor: true });
 
-        // Fulfill referral as admin
         f.client().fulfill_referral(&referee);
         assert_eq!(f.client().get_pending_rewards(&referrer), REWARD_MENTOR);
 
-        // Claim reward as referrer
         f.client().claim_reward(&referrer);
         assert_eq!(f.client().get_pending_rewards(&referrer), 0);
-        // With multiplier 2x for rank 1
+        // Leaderboard rank 1 → 2x, capped at max_multiplier_bps (20000 = 2x)
         assert_eq!(f.mnt_client().balance(&referrer), REWARD_MENTOR * 2);
+        assert_eq!(f.client().get_global_referral_minted(), REWARD_MENTOR * 2);
 
         let events2 = f.env.events().all();
         let last_event2 = events2.last().unwrap();
@@ -412,12 +498,7 @@ mod test {
         );
         let payload2 = RewardClaimedEventData::try_from_val(&f.env, &last_event2.2)
             .expect("reward payload should decode");
-        assert_eq!(
-            payload2,
-            RewardClaimedEventData {
-                amount: REWARD_MENTOR * 2,
-            }
-        );
+        assert_eq!(payload2, RewardClaimedEventData { amount: REWARD_MENTOR * 2 });
     }
 
     #[test]
@@ -438,5 +519,151 @@ mod test {
 
         f.client().register_referral(&referrer1, &referee, &true);
         f.client().register_referral(&referrer2, &referee, &false);
+    }
+
+    /// Multiplier above max_multiplier_bps is clamped, not accepted.
+    #[test]
+    fn test_multiplier_clamped_at_max() {
+        let f = TestFixture::setup();
+
+        // Set a tight config: max multiplier 1.5x (15000 bps)
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: 15_000,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        });
+
+        let referrer = Address::generate(&f.env);
+        let referee = Address::generate(&f.env);
+
+        f.client().register_referral(&referrer, &referee, &true);
+        f.client().fulfill_referral(&referee);
+        // rank 1 → leaderboard would give 20000 (2x), but cap is 15000 (1.5x)
+        f.client().claim_reward(&referrer);
+
+        let expected = (REWARD_MENTOR * 15_000) / 10_000;
+        assert_eq!(f.mnt_client().balance(&referrer), expected);
+    }
+
+    /// Referrer cannot claim beyond max_lifetime_reward.
+    #[test]
+    #[should_panic(expected = "Lifetime reward cap reached")]
+    fn test_lifetime_reward_cap_enforced() {
+        let f = TestFixture::setup();
+
+        // Set tiny lifetime cap so it's exhausted after one claim
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: REWARD_MENTOR * 2, // exactly one 2x claim
+            global_referral_mint_cap: DEFAULT_GLOBAL_REFERRAL_MINT_CAP,
+        });
+
+        let referrer = Address::generate(&f.env);
+
+        // First claim — exhausts lifetime cap
+        let referee1 = Address::generate(&f.env);
+        f.client().register_referral(&referrer, &referee1, &true);
+        f.client().fulfill_referral(&referee1);
+        f.client().claim_reward(&referrer);
+
+        // Second claim — must panic
+        let referee2 = Address::generate(&f.env);
+        f.client().register_referral(&referrer, &referee2, &true);
+        f.client().fulfill_referral(&referee2);
+        f.client().claim_reward(&referrer); // should panic
+    }
+
+    /// Global cap: the claim that would exceed the cap is rejected.
+    #[test]
+    fn test_global_cap_enforced() {
+        let f = TestFixture::setup();
+
+        // Cap = exactly two 2x mentor rewards
+        let cap = REWARD_MENTOR * 2 * 2;
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: cap,
+        });
+
+        let referrer1 = Address::generate(&f.env);
+        let referee1 = Address::generate(&f.env);
+        f.client().register_referral(&referrer1, &referee1, &true);
+        f.client().fulfill_referral(&referee1);
+        f.client().claim_reward(&referrer1);
+
+        let referrer2 = Address::generate(&f.env);
+        let referee2 = Address::generate(&f.env);
+        f.client().register_referral(&referrer2, &referee2, &true);
+        f.client().fulfill_referral(&referee2);
+        f.client().claim_reward(&referrer2);
+
+        // Global minted should equal the cap
+        assert_eq!(f.client().get_global_referral_minted(), cap);
+
+        // Third referrer — global cap exhausted, claim must panic
+        let referrer3 = Address::generate(&f.env);
+        let referee3 = Address::generate(&f.env);
+        f.client().register_referral(&referrer3, &referee3, &true);
+        f.client().fulfill_referral(&referee3);
+
+        let result = std::panic::catch_unwind(|| {
+            f.client().claim_reward(&referrer3);
+        });
+        assert!(result.is_err(), "Expected panic when global cap is reached");
+    }
+
+    /// MNT total supply after all referral claims ≤ supply cap (100M).
+    #[test]
+    fn test_supply_invariant_held() {
+        let f = TestFixture::setup();
+        const MNT_SUPPLY_CAP: i128 = 100_000_000 * 10_000_000;
+
+        // Use the default global referral mint cap (5M MNT)
+        let referrer = Address::generate(&f.env);
+        let referee = Address::generate(&f.env);
+        f.client().register_referral(&referrer, &referee, &true);
+        f.client().fulfill_referral(&referee);
+        f.client().claim_reward(&referrer);
+
+        assert!(f.mnt_client().balance(&referrer) <= MNT_SUPPLY_CAP);
+        assert!(f.client().get_global_referral_minted() <= DEFAULT_GLOBAL_REFERRAL_MINT_CAP);
+    }
+
+    /// Sybil test: 1000 self-referred addresses (via different referrers) cannot exceed the global cap.
+    #[test]
+    fn test_sybil_resistance_1000_addresses() {
+        let f = TestFixture::setup();
+
+        // Set a small global cap to make the invariant observable
+        let global_cap = 100 * REWARD_LEARNER * 2; // 100 learner 2x claims worth
+        f.client().set_config(&ReferralConfig {
+            max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
+            max_lifetime_reward: DEFAULT_MAX_LIFETIME_REWARD,
+            global_referral_mint_cap: global_cap,
+        });
+
+        let mut total_minted: i128 = 0;
+        let mut claims_accepted = 0u32;
+
+        for _ in 0..1000 {
+            let referrer = Address::generate(&f.env);
+            let referee = Address::generate(&f.env);
+            f.client().register_referral(&referrer, &referee, &false); // learner
+            f.client().fulfill_referral(&referee);
+
+            // Stop claiming once cap is hit; just count how many went through
+            if f.client().get_global_referral_minted() >= global_cap {
+                break;
+            }
+            f.client().claim_reward(&referrer);
+            let minted = f.client().get_global_referral_minted();
+            assert!(minted <= global_cap, "Global cap breached at claim {}", claims_accepted);
+            total_minted = minted;
+            claims_accepted += 1;
+        }
+
+        assert!(total_minted <= global_cap);
+        assert!(f.client().get_global_referral_minted() <= global_cap);
     }
 }

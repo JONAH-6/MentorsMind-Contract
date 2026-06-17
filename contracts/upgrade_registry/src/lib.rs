@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -13,20 +13,28 @@ use soroban_sdk::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized  = 1,
-    NotInitialized      = 2,
-    NotAdmin            = 3,
-    ContractNotFound    = 4,
-    AlreadySubscribed   = 5,
-    NotSubscribed       = 6,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    NotAdmin = 3,
+    ContractNotFound = 4,
+    AlreadySubscribed = 5,
+    NotSubscribed = 6,
     /// New version must be strictly greater than the current version.
     VersionNotMonotonic = 7,
     /// A timelock delay must elapse before the upgrade executes.
-    TimelockNotElapsed  = 8,
+    TimelockNotElapsed = 8,
     /// An upgrade is already pending; cancel it first.
-    UpgradePending      = 9,
+    UpgradePending = 9,
     /// No pending upgrade to execute or cancel.
-    NoPendingUpgrade    = 10,
+    NoPendingUpgrade = 10,
+    /// Threshold must be non-zero and no greater than signer count.
+    InvalidThreshold = 11,
+    /// Approval signer is not registered in the current upgrade config.
+    NotSigner = 12,
+    /// Signer list or approval list contains the same address twice.
+    DuplicateSigner = 13,
+    /// Approval count is below the configured threshold.
+    BelowThreshold = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -36,11 +44,18 @@ pub enum Error {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeRecord {
-    pub old_version:    u32,
-    pub new_version:    u32,
+    pub old_version: u32,
+    pub new_version: u32,
     pub changelog_hash: BytesN<32>,
-    pub timestamp:      u64,
-    pub admin:          Address,
+    pub timestamp: u64,
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,19 +67,21 @@ pub struct UpgradeRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingUpgrade {
     /// WASM hash to apply when the timelock expires.
-    pub new_wasm_hash:    BytesN<32>,
+    pub new_wasm_hash: BytesN<32>,
     /// Human-readable contract name for registry bookkeeping.
-    pub contract_name:    Symbol,
+    pub contract_name: Symbol,
     /// New version number (must be > current version).
-    pub new_version:      u32,
+    pub new_version: u32,
     /// Changelog hash for audit trail.
-    pub changelog_hash:   BytesN<32>,
+    pub changelog_hash: BytesN<32>,
     /// Ledger timestamp at which this upgrade was scheduled.
-    pub scheduled_at:     u64,
+    pub scheduled_at: u64,
     /// Earliest timestamp at which `execute_pending_upgrade` may be called.
     pub executable_after: u64,
     /// Admin that initiated the upgrade.
-    pub admin:            Address,
+    pub admin: Address,
+    /// Signers that approved scheduling this upgrade.
+    pub approved_signers: Vec<Address>,
 }
 
 #[contracttype]
@@ -78,6 +95,8 @@ pub enum DataKey {
     PendingUpgrade,
     /// Minimum timelock delay in seconds for upgrades (default 48 h).
     UpgradeDelay,
+    /// M-of-N signer set required for scheduling, executing, and rotating upgrades.
+    UpgradeConfig,
 }
 
 /// Default upgrade timelock: 48 hours.
@@ -98,10 +117,17 @@ impl UpgradeRegistryContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("init")),
-            admin,
-        );
+        let mut signers = Vec::new(&env);
+        signers.push_back(admin.clone());
+        let config = UpgradeConfig {
+            signers,
+            threshold: 1,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeConfig, &config);
+        env.events()
+            .publish((symbol_short!("upgrade"), symbol_short!("init")), admin);
         Ok(())
     }
 
@@ -118,12 +144,14 @@ impl UpgradeRegistryContract {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
-        let min = 3_600_u64;       // 1 hour
+        let min = 3_600_u64; // 1 hour
         let max = 30 * 24 * 3_600_u64; // 30 days
         if delay_secs < min || delay_secs > max {
             panic!("upgrade delay out of range [1h, 30d]");
         }
-        env.storage().instance().set(&DataKey::UpgradeDelay, &delay_secs);
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeDelay, &delay_secs);
         Ok(())
     }
 
@@ -137,7 +165,7 @@ impl UpgradeRegistryContract {
 
     // ─── Two-step time-locked upgrade ────────────────────────────────────
 
-    /// Schedule a UUPS upgrade. Admin only.
+    /// Schedule a UUPS upgrade. Requires M-of-N signer approval.
     ///
     /// The upgrade will not execute immediately — `execute_pending_upgrade`
     /// must be called after `get_upgrade_delay()` seconds have elapsed.
@@ -155,13 +183,9 @@ impl UpgradeRegistryContract {
         contract_name: Symbol,
         new_version: u32,
         changelog_hash: BytesN<32>,
+        approvers: Vec<Address>,
     ) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+        let approved_signers = require_upgrade_approvals(&env, approvers)?;
 
         // Guard: only one pending upgrade at a time.
         if env.storage().instance().has(&DataKey::PendingUpgrade) {
@@ -192,35 +216,43 @@ impl UpgradeRegistryContract {
             changelog_hash: changelog_hash.clone(),
             scheduled_at: now,
             executable_after: now.saturating_add(delay),
-            admin: admin.clone(),
+            admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?,
+            approved_signers: approved_signers.clone(),
         };
 
-        env.storage().instance().set(&DataKey::PendingUpgrade, &pending);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending);
 
         env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("sched"), contract_name),
-            (new_version, now.saturating_add(delay), new_wasm_hash),
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("sched"),
+                contract_name,
+            ),
+            (
+                new_version,
+                now.saturating_add(delay),
+                new_wasm_hash,
+                approved_signers,
+            ),
         );
         Ok(())
     }
 
-    /// Execute the pending upgrade once the timelock has elapsed. Admin only.
+    /// Execute the pending upgrade once the timelock has elapsed.
+    /// Requires fresh M-of-N signer approval.
     ///
     /// Applies the WASM swap, records the upgrade in history, and clears the
     /// pending slot.
-    pub fn execute_pending_upgrade(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-
+    pub fn execute_pending_upgrade(env: Env, approvers: Vec<Address>) -> Result<(), Error> {
         let pending: PendingUpgrade = env
             .storage()
             .instance()
             .get(&DataKey::PendingUpgrade)
             .ok_or(Error::NoPendingUpgrade)?;
+
+        let approved_signers = require_upgrade_approvals_for_pending(&env, approvers, &pending)?;
 
         // Guard: timelock must have elapsed.
         if env.ledger().timestamp() < pending.executable_after {
@@ -239,7 +271,7 @@ impl UpgradeRegistryContract {
             new_version: pending.new_version,
             changelog_hash: pending.changelog_hash.clone(),
             timestamp: env.ledger().timestamp(),
-            admin: admin.clone(),
+            admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?,
         };
 
         let mut history: Vec<UpgradeRecord> = env
@@ -248,24 +280,75 @@ impl UpgradeRegistryContract {
             .get(&DataKey::UpgradeHistory(pending.contract_name.clone()))
             .unwrap_or(Vec::new(&env));
         history.push_back(record);
-        env.storage()
-            .persistent()
-            .set(&DataKey::UpgradeHistory(pending.contract_name.clone()), &history);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LatestVersion(pending.contract_name.clone()), &pending.new_version);
+        env.storage().persistent().set(
+            &DataKey::UpgradeHistory(pending.contract_name.clone()),
+            &history,
+        );
+        env.storage().persistent().set(
+            &DataKey::LatestVersion(pending.contract_name.clone()),
+            &pending.new_version,
+        );
 
         // Clear pending slot before WASM swap to prevent re-entrancy.
         env.storage().instance().remove(&DataKey::PendingUpgrade);
 
         env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("exec"), pending.contract_name),
-            (old_version, pending.new_version, pending.new_wasm_hash.clone()),
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("exec"),
+                pending.contract_name,
+            ),
+            (
+                old_version,
+                pending.new_version,
+                pending.new_wasm_hash.clone(),
+                approved_signers,
+            ),
         );
 
         // Apply the UUPS upgrade.
-        env.deployer().update_current_contract_wasm(pending.new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash);
 
+        Ok(())
+    }
+
+    /// Rotate the signer set and threshold that guard upgrade operations.
+    ///
+    /// The current signer set must approve the rotation before the new config
+    /// is stored.
+    pub fn set_upgrade_signers(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        let approved_signers = require_upgrade_approvals(&env, approvers)?;
+        validate_upgrade_config(&signers, threshold)?;
+
+        let config = UpgradeConfig {
+            signers: signers.clone(),
+            threshold,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeConfig, &config);
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("signers")),
+            (signers, threshold, approved_signers),
+        );
+        Ok(())
+    }
+
+    /// Rotate the legacy admin address. Upgrade-path governance still comes
+    /// from `UpgradeConfig`; this protects the remaining admin-gated methods.
+    pub fn set_admin(env: Env, new_admin: Address, approvers: Vec<Address>) -> Result<(), Error> {
+        let approved_signers = require_upgrade_approvals(&env, approvers)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("admin")),
+            (new_admin, approved_signers),
+        );
         Ok(())
     }
 
@@ -284,10 +367,8 @@ impl UpgradeRegistryContract {
 
         env.storage().instance().remove(&DataKey::PendingUpgrade);
 
-        env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("cancel")),
-            (),
-        );
+        env.events()
+            .publish((symbol_short!("upgrade"), symbol_short!("cancel")), ());
         Ok(())
     }
 
@@ -299,7 +380,7 @@ impl UpgradeRegistryContract {
     /// UUPS upgrade: replace this contract's WASM with a new version.
     ///
     /// This is the core UUPS pattern for Soroban: the upgrade logic lives
-    /// inside the contract itself, authorized by the admin.
+    /// inside the contract itself, authorized by M-of-N signer approval.
     /// After calling this, the contract at the same address runs new code.
     pub fn upgrade_contract(
         env: Env,
@@ -307,13 +388,9 @@ impl UpgradeRegistryContract {
         contract_name: Symbol,
         new_version: u32,
         changelog_hash: BytesN<32>,
+        approvers: Vec<Address>,
     ) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+        let approved_signers = require_upgrade_approvals(&env, approvers)?;
 
         let old_version: u32 = env
             .storage()
@@ -327,7 +404,7 @@ impl UpgradeRegistryContract {
             new_version,
             changelog_hash: changelog_hash.clone(),
             timestamp: env.ledger().timestamp(),
-            admin: admin.clone(),
+            admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?,
         };
 
         let mut history: Vec<UpgradeRecord> = env
@@ -345,8 +422,18 @@ impl UpgradeRegistryContract {
 
         // Emit upgrade event before applying (so indexers see it)
         env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("uups"), contract_name.clone()),
-            (old_version, new_version, new_wasm_hash.clone(), changelog_hash),
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("uups"),
+                contract_name.clone(),
+            ),
+            (
+                old_version,
+                new_version,
+                new_wasm_hash.clone(),
+                changelog_hash,
+                approved_signers,
+            ),
         );
 
         // Apply the UUPS upgrade: swap WASM at this contract address
@@ -396,7 +483,11 @@ impl UpgradeRegistryContract {
             .set(&DataKey::LatestVersion(contract_name.clone()), &new_version);
 
         env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("reg"), contract_name.clone()),
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("reg"),
+                contract_name.clone(),
+            ),
             (old_version, new_version, changelog_hash),
         );
         Ok(())
@@ -464,7 +555,11 @@ impl UpgradeRegistryContract {
         );
 
         env.events().publish(
-            (symbol_short!("sub"), symbol_short!("removed"), contract_name),
+            (
+                symbol_short!("sub"),
+                symbol_short!("removed"),
+                contract_name,
+            ),
             subscriber,
         );
         Ok(())
@@ -502,6 +597,13 @@ impl UpgradeRegistryContract {
             .ok_or(Error::NotInitialized)
     }
 
+    pub fn get_upgrade_config(env: Env) -> Result<UpgradeConfig, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeConfig)
+            .ok_or(Error::NotInitialized)
+    }
+
     /// Check whether a contract meets a minimum required version.
     /// Returns true if the contract's latest version >= min_version.
     pub fn check_min_version(env: Env, contract_name: Symbol, min_version: u32) -> bool {
@@ -520,6 +622,98 @@ impl UpgradeRegistryContract {
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn get_upgrade_config(env: &Env) -> Result<UpgradeConfig, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::UpgradeConfig)
+        .ok_or(Error::NotInitialized)
+}
+
+fn validate_upgrade_config(signers: &Vec<Address>, threshold: u32) -> Result<(), Error> {
+    if threshold == 0 || signers.is_empty() || threshold > signers.len() {
+        return Err(Error::InvalidThreshold);
+    }
+    for i in 0..signers.len() {
+        let signer = signers.get(i).ok_or(Error::NotSigner)?;
+        for j in (i + 1)..signers.len() {
+            if signer == signers.get(j).ok_or(Error::NotSigner)? {
+                return Err(Error::DuplicateSigner);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_upgrade_approvals(env: &Env, approvers: Vec<Address>) -> Result<Vec<Address>, Error> {
+    let config = get_upgrade_config(env)?;
+    validate_approval_set(&config, &approvers)?;
+    for signer in approvers.iter() {
+        signer.require_auth();
+    }
+    Ok(approvers)
+}
+
+fn require_upgrade_approvals_for_pending(
+    env: &Env,
+    approvers: Vec<Address>,
+    pending: &PendingUpgrade,
+) -> Result<Vec<Address>, Error> {
+    let config = get_upgrade_config(env)?;
+    validate_approval_set(&config, &approvers)?;
+    for signer in approvers.iter() {
+        signer.require_auth_for_args(
+            (
+                pending.new_wasm_hash.clone(),
+                pending.contract_name.clone(),
+                pending.new_version,
+                pending.changelog_hash.clone(),
+                pending.scheduled_at,
+                pending.executable_after,
+            )
+                .into_val(env),
+        );
+    }
+    Ok(approvers)
+}
+
+fn validate_approval_set(config: &UpgradeConfig, approvers: &Vec<Address>) -> Result<(), Error> {
+    if approvers.len() < config.threshold {
+        return Err(Error::BelowThreshold);
+    }
+
+    let mut valid_count = 0u32;
+    for i in 0..approvers.len() {
+        let approver = approvers.get(i).ok_or(Error::NotSigner)?;
+        for j in (i + 1)..approvers.len() {
+            if approver == approvers.get(j).ok_or(Error::NotSigner)? {
+                return Err(Error::DuplicateSigner);
+            }
+        }
+        if !is_config_signer(config, &approver) {
+            return Err(Error::NotSigner);
+        }
+        valid_count = valid_count.checked_add(1).expect("approval count overflow");
+    }
+
+    if valid_count < config.threshold {
+        return Err(Error::BelowThreshold);
+    }
+    Ok(())
+}
+
+fn is_config_signer(config: &UpgradeConfig, candidate: &Address) -> bool {
+    for signer in config.signers.iter() {
+        if signer == *candidate {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -532,19 +726,22 @@ mod test {
     fn setup() -> (Env, Address, UpgradeRegistryContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let admin       = Address::generate(&env);
+        let admin = Address::generate(&env);
         let contract_id = env.register_contract(None, UpgradeRegistryContract);
-        let client      = UpgradeRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin).unwrap();
+        let client = UpgradeRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
         (env, admin, client)
     }
 
     #[test]
     fn test_initialize() {
-        let (env, admin, client) = setup();
-        assert_eq!(client.get_admin().unwrap(), admin);
+        let (_env, admin, client) = setup();
+        assert_eq!(client.get_admin(), admin);
         // Double init rejected
-        assert_eq!(client.try_initialize(&admin), Err(Ok(Error::AlreadyInitialized)));
+        assert_eq!(
+            client.try_initialize(&admin),
+            Err(Ok(Error::AlreadyInitialized))
+        );
     }
 
     #[test]
@@ -553,7 +750,7 @@ mod test {
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        client.register_upgrade(&contract_name, &1, &2, &hash).unwrap();
+        client.register_upgrade(&contract_name, &1, &2, &hash);
 
         let history = client.get_upgrade_history(&contract_name);
         assert_eq!(history.len(), 1);
@@ -569,9 +766,9 @@ mod test {
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
-        client.register_upgrade(&contract_name, &1, &2, &hash).unwrap();
-        client.register_upgrade(&contract_name, &2, &3, &hash).unwrap();
-        client.register_upgrade(&contract_name, &3, &4, &hash).unwrap();
+        client.register_upgrade(&contract_name, &1, &2, &hash);
+        client.register_upgrade(&contract_name, &2, &3, &hash);
+        client.register_upgrade(&contract_name, &3, &4, &hash);
 
         let history = client.get_upgrade_history(&contract_name);
         assert_eq!(history.len(), 3);
@@ -582,9 +779,9 @@ mod test {
     fn test_subscribe() {
         let (env, _admin, client) = setup();
         let contract_name = symbol_short!("escrow");
-        let subscriber    = Address::generate(&env);
+        let subscriber = Address::generate(&env);
 
-        client.subscribe(&subscriber, &contract_name).unwrap();
+        client.subscribe(&subscriber, &contract_name);
 
         let subscribers = client.get_subscribers(&contract_name);
         assert_eq!(subscribers.len(), 1);
@@ -601,10 +798,10 @@ mod test {
     fn test_unsubscribe() {
         let (env, _admin, client) = setup();
         let contract_name = symbol_short!("escrow");
-        let subscriber    = Address::generate(&env);
+        let subscriber = Address::generate(&env);
 
-        client.subscribe(&subscriber, &contract_name).unwrap();
-        client.unsubscribe(&subscriber, &contract_name).unwrap();
+        client.subscribe(&subscriber, &contract_name);
+        client.unsubscribe(&subscriber, &contract_name);
 
         assert_eq!(client.get_subscribers(&contract_name).len(), 0);
 
@@ -617,33 +814,33 @@ mod test {
 
     #[test]
     fn test_non_admin_cannot_register_upgrade() {
-        let (env, _admin, client) = setup();
-        let contract_name  = symbol_short!("escrow");
-        let hash           = BytesN::from_array(&env, &[0u8; 32]);
-        let _non_admin     = Address::generate(&env);
+        let (env, admin, client) = setup();
+        let contract_name = symbol_short!("escrow");
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        let _non_admin = Address::generate(&env);
 
         // mock_all_auths is on, but the admin check is enforced by require_auth
         // In a real test without mock_all_auths this would fail; here we verify
         // the admin field is correctly stored and returned
-        assert_eq!(client.get_admin().is_ok(), true);
+        assert_eq!(client.get_admin(), admin);
         // Register succeeds because mock_all_auths is active
-        client.register_upgrade(&contract_name, &0, &1, &hash).unwrap();
+        client.register_upgrade(&contract_name, &0, &1, &hash);
         assert_eq!(client.get_latest_version(&contract_name), 1);
     }
 
     #[test]
     fn test_upgrade_history_independent_per_contract() {
         let (env, _admin, client) = setup();
-        let escrow_name   = symbol_short!("escrow");
+        let escrow_name = symbol_short!("escrow");
         let treasury_name = symbol_short!("treasury");
-        let hash          = BytesN::from_array(&env, &[0u8; 32]);
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
 
-        client.register_upgrade(&escrow_name,   &1, &2, &hash).unwrap();
-        client.register_upgrade(&treasury_name, &1, &3, &hash).unwrap();
+        client.register_upgrade(&escrow_name, &1, &2, &hash);
+        client.register_upgrade(&treasury_name, &1, &3, &hash);
 
-        assert_eq!(client.get_latest_version(&escrow_name),   2);
+        assert_eq!(client.get_latest_version(&escrow_name), 2);
         assert_eq!(client.get_latest_version(&treasury_name), 3);
-        assert_eq!(client.get_upgrade_history(&escrow_name).len(),   1);
+        assert_eq!(client.get_upgrade_history(&escrow_name).len(), 1);
         assert_eq!(client.get_upgrade_history(&treasury_name).len(), 1);
     }
 }
