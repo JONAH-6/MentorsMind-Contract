@@ -1,5 +1,9 @@
 #![no_std]
 
+use shared::events::{
+    emit_bounty_event, evt_bounty_claimed, evt_bounty_disputed, evt_bounty_posted,
+    evt_bounty_refunded, evt_bounty_verified,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Val, Vec,
@@ -208,8 +212,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::BountyCount, TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("posted")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_posted(&env),
             BountyPostedEvent {
                 id: count,
                 poster,
@@ -270,8 +275,9 @@ impl BountyContract {
 
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("claimed")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_claimed(&env),
             BountyClaimedEvent {
                 bounty_id,
                 learner,
@@ -345,8 +351,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("verified")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_verified(&env),
             BountyVerifiedEvent {
                 bounty_id,
                 learner,
@@ -405,8 +412,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("disputed")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_disputed(&env),
             BountyDisputedEvent {
                 bounty_id,
                 learner,
@@ -451,8 +459,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("refunded")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_refunded(&env),
             BountyRefundedEvent {
                 bounty_id,
                 poster: bounty.poster.clone(),

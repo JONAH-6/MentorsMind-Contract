@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
@@ -194,12 +195,9 @@ impl StakingContract {
             .persistent()
             .set(&DataKey::TotalStaked, &(total_staked.checked_add(amount).expect("Overflow")));
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "Staking"),
-                Symbol::new(&env, "staked"),
-                mentor.clone(),
-            ),
+        emit_staking_event(
+            &env,
+            evt_staking_staked(&env),
             StakedEventData {
                 mentor,
                 amount,
@@ -276,12 +274,9 @@ impl StakingContract {
             .persistent()
             .set(&DataKey::TotalStaked, &(total_staked.checked_sub(record.amount).expect("Underflow")));
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "Staking"),
-                Symbol::new(&env, "unstaked"),
-                mentor.clone(),
-            ),
+        emit_staking_event(
+            &env,
+            evt_staking_unstaked(&env),
             UnstakedEventData {
                 mentor,
                 amount: record.amount,

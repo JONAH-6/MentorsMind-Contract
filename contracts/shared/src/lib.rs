@@ -7,6 +7,7 @@ use soroban_sdk::contracterror;
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod escrow;
+pub mod events;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
