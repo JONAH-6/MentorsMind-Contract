@@ -13,6 +13,8 @@ members = [
     "contracts/referral",
     "contracts/referral_leaderboard",
     "benchmarks",
+    "contracts/treasury",
+    "contracts/timelock",
 ]
 
 [workspace.package]
