@@ -41,10 +41,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust 1.70
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.70'
+          toolchain: '1.85'
           targets: wasm32-unknown-unknown
 
       # Layered caching: registry index, downloaded crates, compiled artifacts

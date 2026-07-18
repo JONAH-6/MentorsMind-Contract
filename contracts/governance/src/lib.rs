@@ -1,5 +1,12 @@
 #![no_std]
 
+use shared::events::{
+    emit_governance_event,
+    evt_gov_appeal_resolved, evt_gov_appeal_submitted, evt_gov_arb_registered,
+    evt_gov_arb_unregistered, evt_gov_call_allowed, evt_gov_proposal_cancelled,
+    evt_gov_proposal_created, evt_gov_proposal_executed, evt_gov_proposal_failed,
+    evt_gov_proposal_passed, evt_gov_proposal_queued, evt_gov_timelock_set, evt_gov_vote_cast,
+};
 use shared::StateMachine;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal,
@@ -171,13 +178,7 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Timelock, &timelock);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                Symbol::new(&env, "timelock_set"),
-            ),
-            timelock,
-        );
+        emit_governance_event(&env, evt_gov_timelock_set(&env), timelock);
     }
 
     /// Add a (target, function) pair to the ExecuteCall allowlist. Admin only.
@@ -186,10 +187,7 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::AllowedCall(target.clone(), function.clone()), &true);
-        env.events().publish(
-            (Symbol::new(&env, "governance"), Symbol::new(&env, "call_allowed")),
-            (target, function),
-        );
+        emit_governance_event(&env, evt_gov_call_allowed(&env), (target, function));
     }
 
     pub fn is_call_allowed(env: Env, target: Address, function: Symbol) -> bool {
@@ -273,12 +271,9 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Proposal(count), &proposal);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                Symbol::new(&env, "proposal_created"),
-                count,
-            ),
+        emit_governance_event(
+            &env,
+            evt_gov_proposal_created(&env),
             (proposer, proposal.snapshot_ledger, proposal.voting_ends_at),
         );
 
@@ -330,14 +325,7 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                symbol_short!("vote_cast"),
-                proposal_id,
-            ),
-            (voter, support, weight),
-        );
+        emit_governance_event(&env, evt_gov_vote_cast(&env), (voter, support, weight));
     }
 
     pub fn execute_proposal(env: Env, proposal_id: u32) {
@@ -383,24 +371,18 @@ impl GovernanceContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
-            env.events().publish(
-                (
-                    Symbol::new(&env, "governance"),
-                    Symbol::new(&env, "proposal_failed"),
-                    proposal_id,
-                ),
+            emit_governance_event(
+                &env,
+                evt_gov_proposal_failed(&env),
                 (proposal.votes_for, proposal.votes_against, quorum_met),
             );
             return;
         }
 
         Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Passed);
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                Symbol::new(&env, "proposal_passed"),
-                proposal_id,
-            ),
+        emit_governance_event(
+            &env,
+            evt_gov_proposal_passed(&env),
             (proposal.votes_for, proposal.votes_against, quorum_met),
         );
 
@@ -442,14 +424,7 @@ impl GovernanceContract {
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
 
-            env.events().publish(
-                (
-                    Symbol::new(&env, "governance"),
-                    Symbol::new(&env, "proposal_queued"),
-                    proposal_id,
-                ),
-                op_id,
-            );
+            emit_governance_event(&env, evt_gov_proposal_queued(&env), op_id);
         } else {
             Self::apply_action(&env, &proposal.action);
             Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Executed);
@@ -458,14 +433,7 @@ impl GovernanceContract {
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
 
-            env.events().publish(
-                (
-                    Symbol::new(&env, "governance"),
-                    Symbol::new(&env, "proposal_executed"),
-                    proposal_id,
-                ),
-                true,
-            );
+            emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
         }
     }
 
@@ -487,14 +455,7 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                Symbol::new(&env, "proposal_executed"),
-                proposal_id,
-            ),
-            true,
-        );
+        emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
     }
 
     pub fn cancel_proposal(env: Env, proposal_id: u32) {
@@ -519,14 +480,7 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "governance"),
-                Symbol::new(&env, "proposal_cancelled"),
-                proposal_id,
-            ),
-            proposal.proposer.clone(),
-        );
+        emit_governance_event(&env, evt_gov_proposal_cancelled(&env), proposal.proposer.clone());
     }
 
     /// Register an arbitrator for dispute resolution (#470).
@@ -544,10 +498,7 @@ impl GovernanceContract {
             env.storage().persistent().set(&DataKey::ArbitratorCount, &(count + 1));
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "governance"), Symbol::new(&env, "arbitrator_registered")),
-            arbitrator,
-        );
+        emit_governance_event(&env, evt_gov_arb_registered(&env), arbitrator);
     }
 
     pub fn unregister_arbitrator(env: Env, admin: Address, arbitrator: Address) {
@@ -576,10 +527,7 @@ impl GovernanceContract {
         env.storage().persistent().remove(&key);
         env.storage().persistent().set(&DataKey::ArbitratorCount, &last_index);
         
-        env.events().publish(
-            (Symbol::new(&env, "governance"), Symbol::new(&env, "arbitrator_unregistered")),
-            arbitrator,
-        );
+        emit_governance_event(&env, evt_gov_arb_unregistered(&env), arbitrator);
     }
 
     pub fn get_arbitrator_count(env: Env) -> u32 {
@@ -659,7 +607,7 @@ impl GovernanceContract {
             resolved: false,
         };
         env.storage().persistent().set(&DataKey::Appeal(proposal_id), &appeal);
-        env.events().publish(("appeal_submitted", proposal_id), ());
+        emit_governance_event(&env, evt_gov_appeal_submitted(&env), (appellant, proposal_id));
     }
 
     pub fn resolve_appeal(env: Env, arbitrator: Address, proposal_id: u32) {
@@ -679,8 +627,8 @@ impl GovernanceContract {
         let mut record: ArbitratorRecord = env.storage().persistent()
             .get(&DataKey::Arbitrator(arbitrator.clone())).expect("arbitrator not found");
         record.cases_handled += 1;
-        env.storage().persistent().set(&DataKey::Arbitrator(arbitrator), &record);
-        env.events().publish(("appeal_resolved", proposal_id), ());
+        env.storage().persistent().set(&DataKey::Arbitrator(arbitrator.clone()), &record);
+        emit_governance_event(&env, evt_gov_appeal_resolved(&env), (arbitrator, proposal_id));
     }
 
     pub fn get_appeal(env: Env, proposal_id: u32) -> AppealRecord {

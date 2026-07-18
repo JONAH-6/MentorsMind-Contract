@@ -1,4 +1,8 @@
 #![no_std]
+use shared::events::{
+    emit_timelock_event, evt_timelock_adm_xfr, evt_timelock_cancel, evt_timelock_exec,
+    evt_timelock_init, evt_timelock_sched,
+};
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     Symbol, Val, Vec,
@@ -76,7 +80,7 @@ impl TimelockController {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::OpCount, &0u64);
-        env.events().publish((symbol_short!("timelock"), symbol_short!("init")), admin);
+        emit_timelock_event(&env, evt_timelock_init(&env), admin);
         Ok(())
     }
 
@@ -130,8 +134,9 @@ impl TimelockController {
         };
         env.storage().persistent().set(&DataKey::Op(op_id.clone()), &op);
 
-        env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("sched"), op_id.clone()),
+        emit_timelock_event(
+            &env,
+            evt_timelock_sched(&env),
             (caller, target, function, delay),
         );
         Ok(op_id)
@@ -171,10 +176,7 @@ impl TimelockController {
             .persistent()
             .set(&DataKey::Op(operation_id.clone()), &op);
 
-        env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("exec"), operation_id),
-            true,
-        );
+        emit_timelock_event(&env, evt_timelock_exec(&env), operation_id);
     }
 
     /// Cancel a scheduled operation.
@@ -201,10 +203,7 @@ impl TimelockController {
 
         env.storage().persistent().remove(&DataKey::Op(operation_id.clone()));
 
-        env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("cancel"), operation_id),
-            true,
-        );
+        emit_timelock_event(&env, evt_timelock_cancel(&env), operation_id);
     }
 
     /// Transfer admin role (requires current admin auth).
@@ -216,10 +215,7 @@ impl TimelockController {
             .expect("not initialized");
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("adm_xfr")),
-            (admin, new_admin),
-        );
+        emit_timelock_event(&env, evt_timelock_adm_xfr(&env), (admin, new_admin));
     }
 
     // -----------------------------------------------------------------------
