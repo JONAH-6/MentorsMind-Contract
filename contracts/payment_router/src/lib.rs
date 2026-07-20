@@ -226,6 +226,10 @@ impl PaymentRouter {
             Self::validate_oracle_price(&env, oracle, &token);
         }
 
+        // Calculate fee and net amount
+        let fee = Self::calculate_fee(env.clone(), amount);
+        let net_amount = amount.checked_sub(fee).unwrap_or(0);
+
         // For Stellar direct payments, transfer tokens from learner to escrow
         if source_chain == CHAIN_STELLAR {
             let token_client = token::Client::new(&env, &token);
@@ -664,13 +668,10 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::EscrowIdCounter)
             .unwrap_or(0);
-
-        match counter % 4 {
-            0 => Symbol::new(env, "ROUTER_PAY_A"),
-            1 => Symbol::new(env, "ROUTER_PAY_B"),
-            2 => Symbol::new(env, "ROUTER_PAY_C"),
-            _ => Symbol::new(env, "ROUTER_PAY_D"),
-        }
+        
+        // Create a symbol with "RT_" prefix followed by the counter
+        let symbol_str = format!("RT_{}", counter);
+        Symbol::new(env, &symbol_str)
     }
 
     fn emit_payment_routed(env: &Env, event: PaymentRoutedEvent) {
