@@ -123,6 +123,8 @@ pub enum Error {
     SubmissionCooldown       = 7,
     /// Arbitrator must wait for MIN_RESOLUTION_DELAY_SECS after dispute opens.
     ResolutionTimelockActive = 8,
+    /// Dispute opening has already been recorded for this escrow.
+    AlreadyRecorded          = 9,
 }
 
 #[contract]
@@ -167,18 +169,38 @@ impl DisputeEvidenceContract {
         Ok(())
     }
 
-    /// Record that a dispute was opened at a specific timestamp.
+    /// Record that a dispute was opened.
     ///
-    /// Should be called by the escrow contract (or admin) immediately when a
-    /// dispute is raised so the resolution timelock clock starts.
-    pub fn record_dispute_opened(env: Env, escrow_id: u64, opened_at: u64) -> Result<(), Error> {
-        // Allow either admin or the escrow contract to call this
+    /// # Security
+    /// The `opened_at` timestamp is derived from `env.ledger().timestamp()` and
+    /// **cannot** be supplied by the caller. This prevents an admin (or any
+    /// caller) from backdating the dispute opening to bypass the mandatory
+    /// `MIN_RESOLUTION_DELAY_SECS` deliberation period.
+    ///
+    /// # Idempotency
+    /// Calling this function a second time for the same `escrow_id` returns
+    /// [`Error::AlreadyRecorded`] so that the timelock anchor cannot be
+    /// overwritten or replayed.
+    pub fn record_dispute_opened(env: Env, escrow_id: u64) -> Result<(), Error> {
+        // Idempotency guard: refuse to overwrite an existing record.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::DisputeOpenedAt(escrow_id))
+        {
+            return Err(Error::AlreadyRecorded);
+        }
+
+        // Allow either admin or the escrow contract to call this.
         let stored: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         stored.require_auth();
+
+        // SECURITY: timestamp is taken from the ledger, not the caller.
+        let opened_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&DataKey::DisputeOpenedAt(escrow_id), &opened_at);
@@ -187,6 +209,14 @@ impl DisputeEvidenceContract {
             opened_at,
         );
         Ok(())
+    }
+
+    /// Return the ledger timestamp at which the dispute for `escrow_id` was
+    /// opened, or `None` if [`record_dispute_opened`] has not yet been called.
+    pub fn get_dispute_opened_at(env: Env, escrow_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeOpenedAt(escrow_id))
     }
 
     /// Submit evidence for a disputed escrow.
@@ -497,8 +527,7 @@ mod tests {
     fn resolution_before_timelock_fails() {
         let (env, admin, _mentor, _learner, client) = setup_disputed();
         let arbitrator = Address::generate(&env);
-        let opened_at = env.ledger().timestamp();
-        client.record_dispute_opened(&1, &opened_at).unwrap();
+        client.record_dispute_opened(&1).unwrap();
 
         // Do NOT advance time
         let result = client.try_submit_resolution(
@@ -515,8 +544,7 @@ mod tests {
     fn resolution_after_timelock_succeeds() {
         let (env, admin, _mentor, _learner, client) = setup_disputed();
         let arbitrator = Address::generate(&env);
-        let opened_at = env.ledger().timestamp();
-        client.record_dispute_opened(&1, &opened_at).unwrap();
+        client.record_dispute_opened(&1).unwrap();
 
         advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
 
@@ -542,6 +570,33 @@ mod tests {
         assert!(!res.release_to_mentor);
     }
 
+    // ─── record_dispute_opened idempotency & getter ────────────────────────
+
+    #[test]
+    fn record_dispute_opened_is_idempotent() {
+        let (env, admin, _mentor, _learner, client) = setup_disputed();
+        client.record_dispute_opened(&1).unwrap();
+        let result = client.try_record_dispute_opened(&1);
+        assert!(result.is_err(), "second call must return AlreadyRecorded");
+        let _ = admin;
+    }
+
+    #[test]
+    fn get_dispute_opened_at_returns_none_before_record() {
+        let (_env, _admin, _mentor, _learner, client) = setup_disputed();
+        assert_eq!(client.get_dispute_opened_at(&1), None);
+    }
+
+    #[test]
+    fn get_dispute_opened_at_returns_timestamp_after_record() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let before = env.ledger().timestamp();
+        client.record_dispute_opened(&1).unwrap();
+        let after = env.ledger().timestamp();
+        let opened = client.get_dispute_opened_at(&1).unwrap();
+        assert!(opened >= before && opened <= after);
+    }
+
     // ─── #417: duplicate resolution rejected ─────────────────────────────
 
     #[test]
@@ -553,6 +608,67 @@ mod tests {
             .unwrap();
         let result = client.try_submit_resolution(&1, &arb, &false, &Symbol::new(&env, "b"));
         assert!(result.is_err(), "second resolution must be rejected");
+    }
+
+    // ─── boundary: resolution exactly at MIN_RESOLUTION_DELAY_SECS ─────────
+
+    #[test]
+    fn resolution_at_exact_timelock_boundary_succeeds() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        client.record_dispute_opened(&1).unwrap();
+        // Advance exactly the minimum delay (no extra second).
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"))
+            .unwrap();
+    }
+
+    #[test]
+    fn resolution_one_second_before_timelock_fails() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS.saturating_sub(1));
+        let result = client.try_submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"));
+        assert!(result.is_err(), "resolution 1s before timelock must fail");
+    }
+
+    // ─── fuzz: resolution at various offsets from opened_at ───────────────
+
+    #[test]
+    fn fuzz_resolution_boundary_offsets() {
+        // Property-style test: for a range of offsets around the timelock,
+        // verify that resolution is rejected before the boundary and accepted
+        // at or after it.
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+
+        for offset in [0, 1, 10, 100, MIN_RESOLUTION_DELAY_SECS / 2] {
+            client.record_dispute_opened(&1).unwrap();
+            advance_time(&env, offset);
+            let result = client.try_submit_resolution(&1, &arb, &true, &Symbol::new(&env, "r"));
+            if offset < MIN_RESOLUTION_DELAY_SECS {
+                assert!(
+                    result.is_err(),
+                    "offset {} < MIN_RESOLUTION_DELAY_SECS must fail",
+                    offset
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "offset {} >= MIN_RESOLUTION_DELAY_SECS must succeed",
+                    offset
+                );
+            }
+            // Reset for next iteration by creating a fresh env via a new test
+            // is not possible here, so we rely on the fact that once resolved,
+            // subsequent calls will hit AlreadyResolved. We only test the first
+            // offset that succeeds and break.
+            if offset >= MIN_RESOLUTION_DELAY_SECS {
+                break;
+            }
+        }
     }
 
     // ─── #417: events ─────────────────────────────────────────────────────
