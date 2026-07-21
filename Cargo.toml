@@ -16,6 +16,7 @@ members = [
     "contracts/treasury",
     "contracts/timelock",
     "contracts/payment_router",
+    "contracts/dispute_evidence",
 ]
 
 [workspace.package]
